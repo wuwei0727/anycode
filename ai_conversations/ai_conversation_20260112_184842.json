@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-01-12T18:48:42.461246",
+  "project_directory": "d:\\cusor项目\\Any-code-main\\Any-code-main",
+  "summary": "应用已完全重新编译启动。请进入：设置(齿轮图标)  Provider/代理商 标签页  点击'Codex代理商'子标签。应该能看到顶部的'服务商模式切换'卡片。如果还报错请截图告诉我具体错误内容",
+  "feedback": [
+    {
+      "type": "text",
+      "content": "Invalid count value: -1\n还是报错啊，打不开页面",
+      "timestamp": "2026-01-12T18:48:41.099660"
+    }
+  ],
+  "system_info": {
+    "操作系统": "Windows",
+    "系统版本": "10.0.26100",
+    "架构": "64bit",
+    "处理器": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "Python版本": "3.11.0",
+    "当前工作目录": "D:\\cusor项目\\Any-code-main\\Any-code-main",
+    "用户名": "Admin",
+    "时间戳": "2026-01-12T18:48:42.499172"
+  },
+  "feedback_count": 1,
+  "conversation_id": "20260112_184842"
+}

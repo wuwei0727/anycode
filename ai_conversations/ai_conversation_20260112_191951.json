@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-01-12T19:19:51.714002",
+  "project_directory": "d:\\cusor项目\\Any-code-main\\Any-code-main",
+  "summary": "已修复切换配置时不备份config.toml的问题。添加了backup_config_toml()函数，在switch_codex_provider、switch_to_official_mode、switch_to_third_party_mode三个函数写入config.toml之前自动备份到config.toml.bak",
+  "feedback": [
+    {
+      "type": "text",
+      "content": "需要改下是插入到之前的文件里面，现在你是直接替换。导致用户配置的其他配置直接被你替换没了，替换前要重新有没有重复配置",
+      "timestamp": "2026-01-12T19:19:50.577826"
+    }
+  ],
+  "system_info": {
+    "操作系统": "Windows",
+    "系统版本": "10.0.26100",
+    "架构": "64bit",
+    "处理器": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "Python版本": "3.11.0",
+    "当前工作目录": "D:\\cusor项目\\Any-code-main\\Any-code-main",
+    "用户名": "Admin",
+    "时间戳": "2026-01-12T19:19:51.747829"
+  },
+  "feedback_count": 1,
+  "conversation_id": "20260112_191951"
+}

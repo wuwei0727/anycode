@@ -1,0 +1,603 @@
+import React, { useState, useRef, forwardRef, useImperativeHandle, useEffect, useReducer, useCallback } from "react";
+import { AnimatePresence } from "framer-motion";
+import { Sparkles } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { FloatingPromptInputProps, FloatingPromptInputRef, ThinkingMode, ModelType, ModelConfig } from "./types";
+import { THINKING_MODES, MODELS } from "./constants";
+import { useImageHandling } from "./hooks/useImageHandling";
+import { useFileSelection } from "./hooks/useFileSelection";
+import { usePromptEnhancement } from "./hooks/usePromptEnhancement";
+import { useEnhancementHistory } from "./hooks/useEnhancementHistory";
+import { api } from "@/lib/api";
+import { getEnabledProviders } from "@/lib/promptEnhancementService";
+import { inputReducer, initialState } from "./reducer";
+
+// Import sub-components
+import { InputArea } from "./InputArea";
+import { AttachmentPreview } from "./AttachmentPreview";
+import { ControlBar } from "./ControlBar";
+import { ExpandedModal } from "./ExpandedModal";
+import { PreviewDialog } from "./PreviewDialog";
+import { EnhancementHistoryPanel } from "./EnhancementHistoryPanel";
+
+// Re-export types for external use
+export type { FloatingPromptInputRef, FloatingPromptInputProps, ThinkingMode, ModelType } from "./types";
+
+/**
+ * FloatingPromptInput - Refactored modular component
+ */
+const FloatingPromptInputInner = (
+  {
+    onSend,
+    isLoading = false,
+    disabled = false,
+    defaultModel = "sonnet",
+    sessionModel,
+    projectPath,
+    sessionId,
+    projectId,
+    className,
+    onCancel,
+    getConversationContext,
+    messages,
+    isPlanMode = false,
+    onTogglePlanMode,
+    sessionCost,
+    sessionStats,
+    hasMessages = false,
+    session,
+    executionEngineConfig: externalEngineConfig,
+    onExecutionEngineConfigChange,
+  }: FloatingPromptInputProps,
+  ref: React.Ref<FloatingPromptInputRef>,
+) => {
+  // Helper function to convert backend model string to frontend ModelType
+  const parseSessionModel = (modelStr?: string): ModelType | null => {
+    if (!modelStr) return null;
+
+    const lowerModel = modelStr.toLowerCase();
+    if (lowerModel.includes("opus")) return "opus";
+    if (lowerModel.includes("sonnet") && lowerModel.includes("1m")) return "sonnet1m";
+    if (lowerModel.includes("sonnet")) return "sonnet";
+
+    return null;
+  };
+
+  // Use Reducer for state management
+  const [state, dispatch] = useReducer(inputReducer, {
+    ...initialState,
+    selectedModel: parseSessionModel(sessionModel) || defaultModel,
+    executionEngineConfig: externalEngineConfig || initialState.executionEngineConfig,
+  });
+
+  // Initialize enableProjectContext from localStorage
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem('enable_project_context');
+      if (stored === 'true') {
+        dispatch({ type: "SET_ENABLE_PROJECT_CONTEXT", payload: true });
+      }
+    } catch {
+      // Ignore error
+    }
+  }, []);
+
+  // Initialize thinking mode from localStorage
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem('thinking_mode');
+      if (stored === 'off' || stored === 'on') {
+        dispatch({ type: "SET_THINKING_MODE", payload: stored });
+      }
+    } catch {
+      // Ignore error
+    }
+  }, []);
+
+  // Sync external config changes
+  useEffect(() => {
+    if (externalEngineConfig && externalEngineConfig.engine !== state.executionEngineConfig.engine) {
+      dispatch({ type: "SET_EXECUTION_ENGINE_CONFIG", payload: externalEngineConfig });
+    }
+  }, [externalEngineConfig]);
+
+  // Persist execution engine config
+  useEffect(() => {
+    try {
+      localStorage.setItem('execution_engine_config', JSON.stringify(state.executionEngineConfig));
+      onExecutionEngineConfigChange?.(state.executionEngineConfig);
+    } catch (error) {
+      console.error('[ExecutionEngine] Failed to save config to localStorage:', error);
+    }
+  }, [state.executionEngineConfig, onExecutionEngineConfigChange]);
+
+  // Dynamic model list
+  const [availableModels, setAvailableModels] = useState<ModelConfig[]>(MODELS);
+
+  // 🔧 Mac 输入法兼容：追踪 IME 组合输入状态
+  const [isComposing, setIsComposing] = useState(false);
+  // 记录 compositionend 时间戳，用于冷却期检测
+  const compositionEndTimeRef = useRef(0);
+
+  // Refs
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const expandedTextareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Custom hooks
+  const {
+    imageAttachments,
+    embeddedImages,
+    dragActive,
+    handlePaste,
+    handleRemoveImageAttachment,
+    handleRemoveEmbeddedImage,
+    handleDrag,
+    handleDrop,
+    addImage,
+    setImageAttachments,
+    setEmbeddedImages,
+  } = useImageHandling({
+    prompt: state.prompt,
+    projectPath,
+    isExpanded: state.isExpanded,
+    onPromptChange: (p) => dispatch({ type: "SET_PROMPT", payload: p }),
+    textareaRef,
+    expandedTextareaRef,
+  });
+
+  const {
+    showFilePicker,
+    filePickerQuery,
+    detectAtSymbol,
+    updateFilePickerQuery,
+    handleFileSelect,
+    handleFilePickerClose,
+    setShowFilePicker,
+    setFilePickerQuery,
+  } = useFileSelection({
+    prompt: state.prompt,
+    projectPath,
+    cursorPosition: state.cursorPosition,
+    isExpanded: state.isExpanded,
+    onPromptChange: (p) => dispatch({ type: "SET_PROMPT", payload: p }),
+    onCursorPositionChange: (p) => dispatch({ type: "SET_CURSOR_POSITION", payload: p }),
+    textareaRef,
+    expandedTextareaRef,
+  });
+
+
+  const {
+    isEnhancing,
+    handleEnhancePromptWithAPI,
+    enableDualAPI,
+    setEnableDualAPI,
+    // 🆕 新增功能
+    defaultProviderId,
+    setDefaultProviderId,
+    previewState,
+    applyEnhancement,
+    cancelEnhancement,
+    triggerEnhancement,
+  } = usePromptEnhancement({
+    prompt: state.prompt,
+    isExpanded: state.isExpanded,
+    onPromptChange: (p) => dispatch({ type: "SET_PROMPT", payload: p }),
+    getConversationContext,
+    messages,
+    textareaRef,
+    expandedTextareaRef,
+    projectPath,
+    sessionId,
+    projectId,
+    enableProjectContext: state.enableProjectContext,
+    enableMultiRound: true,
+  });
+
+  // 🆕 优化历史 Hook
+  const {
+    history: enhancementHistory,
+    addToHistory,
+    clearHistory,
+  } = useEnhancementHistory();
+
+  // 🆕 历史面板状态
+  const [showHistoryPanel, setShowHistoryPanel] = useState(false);
+
+  // Persist project context switch
+  useEffect(() => {
+    try {
+      localStorage.setItem('enable_project_context', state.enableProjectContext.toString());
+    } catch (error) {
+      console.warn('Failed to save enable_project_context to localStorage:', error);
+    }
+  }, [state.enableProjectContext]);
+
+  // Restore session model
+  useEffect(() => {
+    const parsedSessionModel = parseSessionModel(sessionModel);
+    if (parsedSessionModel) {
+      dispatch({ type: "SET_MODEL", payload: parsedSessionModel });
+    }
+  }, [sessionModel]);
+
+  // Load custom models
+  useEffect(() => {
+    const loadCustomModel = async () => {
+      try {
+        const settings = await api.getClaudeSettings();
+        const envVars = settings?.data?.env || settings?.env;
+
+        if (envVars && typeof envVars === 'object') {
+          const customModel = envVars.ANTHROPIC_MODEL ||
+                             envVars.ANTHROPIC_DEFAULT_SONNET_MODEL ||
+                             envVars.ANTHROPIC_DEFAULT_OPUS_MODEL;
+
+          if (customModel && typeof customModel === 'string') {
+            const isThirdPartyModel = !customModel.toLowerCase().includes('claude') &&
+                                     !customModel.toLowerCase().includes('sonnet') &&
+                                     !customModel.toLowerCase().includes('opus');
+
+            if (isThirdPartyModel) {
+              const customModelConfig: ModelConfig = {
+                id: "custom" as ModelType,
+                name: customModel,
+                description: "Third-party model from settings.json",
+                icon: <Sparkles className="h-4 w-4" />
+              };
+
+              setAvailableModels(prev => {
+                const hasCustom = prev.some(m => m.id === "custom");
+                if (!hasCustom) return [...prev, customModelConfig];
+                return prev;
+              });
+            }
+          }
+        }
+      } catch (error) {
+        console.error('[FloatingPromptInput] Failed to load custom model:', error);
+      }
+    };
+
+    loadCustomModel();
+  }, []);
+
+  // Imperative handle
+  useImperativeHandle(ref, () => ({
+    addImage,
+    setPrompt: (text: string) => dispatch({ type: "SET_PROMPT", payload: text }),
+    setImageAttachments: (attachments) => setImageAttachments(attachments),
+  }));
+
+  // Toggle thinking mode
+  const handleToggleThinkingMode = useCallback(async () => {
+    const currentMode = state.selectedThinkingMode;
+    const newMode: ThinkingMode = currentMode === "off" ? "on" : "off";
+    dispatch({ type: "SET_THINKING_MODE", payload: newMode });
+
+    // Persist to localStorage
+    try {
+      localStorage.setItem('thinking_mode', newMode);
+    } catch {
+      // Ignore localStorage errors
+    }
+
+    try {
+      const thinkingMode = THINKING_MODES.find(m => m.id === newMode);
+      const enabled = newMode === "on";
+      const tokens = thinkingMode?.tokens;
+      await api.updateThinkingMode(enabled, tokens);
+    } catch (error) {
+      console.error("Failed to update thinking mode:", error);
+      // Revert state and localStorage on API error
+      const revertedMode = currentMode;
+      dispatch({ type: "SET_THINKING_MODE", payload: revertedMode });
+      try {
+        localStorage.setItem('thinking_mode', revertedMode);
+      } catch {
+        // Ignore localStorage errors
+      }
+    }
+  }, [state.selectedThinkingMode]);
+
+  // Focus management
+  useEffect(() => {
+    if (state.isExpanded && expandedTextareaRef.current) {
+      expandedTextareaRef.current.focus();
+    } else if (!state.isExpanded && textareaRef.current) {
+      textareaRef.current.focus();
+    }
+  }, [state.isExpanded]);
+
+  // Auto-resize textarea
+  const adjustTextareaHeight = (textarea: HTMLTextAreaElement | null) => {
+    if (!textarea) return;
+    textarea.style.height = 'auto';
+    const maxHeight = state.isExpanded ? 600 : 300;
+    const newHeight = Math.min(textarea.scrollHeight, maxHeight);
+    textarea.style.height = `${newHeight}px`;
+    if (textarea.scrollHeight > maxHeight) {
+      textarea.scrollTop = textarea.scrollHeight;
+    }
+  };
+
+  useEffect(() => {
+    const textarea = state.isExpanded ? expandedTextareaRef.current : textareaRef.current;
+    adjustTextareaHeight(textarea);
+  }, [state.prompt, state.isExpanded]);
+
+  // Tab key listener
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const activeElement = document.activeElement;
+        const isInTextarea = activeElement?.tagName === 'TEXTAREA';
+        if (!isInTextarea && !disabled) {
+          e.preventDefault();
+          handleToggleThinkingMode();
+        }
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [disabled, handleToggleThinkingMode]);
+
+  // 🆕 优化快捷键 Ctrl+Shift+E
+  useEffect(() => {
+    const handleEnhanceShortcut = async (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'E') {
+        e.preventDefault();
+        if (!disabled && state.prompt.trim() && !isEnhancing) {
+          await triggerEnhancement();
+        }
+      }
+    };
+    document.addEventListener('keydown', handleEnhanceShortcut);
+    return () => document.removeEventListener('keydown', handleEnhanceShortcut);
+  }, [disabled, state.prompt, isEnhancing, triggerEnhancement]);
+
+  // 🆕 处理优化按钮点击
+  const handleEnhanceClick = useCallback(async (providerId?: string) => {
+    await triggerEnhancement(providerId);
+    // 预览状态会自动更新，不需要额外处理
+  }, [triggerEnhancement]);
+
+  // 🆕 处理应用优化
+  const handleApplyEnhancement = useCallback((prompt: string) => {
+    if (previewState) {
+      // 添加到历史记录
+      addToHistory({
+        originalPrompt: previewState.originalPrompt,
+        enhancedPrompt: prompt,
+        providerId: previewState.providerId,
+        providerName: previewState.providerName,
+      });
+    }
+    applyEnhancement(prompt);
+  }, [previewState, addToHistory, applyEnhancement]);
+
+  // 🆕 处理从历史恢复
+  const handleRestoreFromHistory = useCallback((item: any) => {
+    dispatch({ type: "SET_PROMPT", payload: item.enhancedPrompt });
+    setShowHistoryPanel(false);
+  }, []);
+
+  // Event handlers
+  const handleSend = () => {
+    // Allow sending if there's text content OR image attachments
+    if ((state.prompt.trim() || imageAttachments.length > 0) && !disabled) {
+      let finalPrompt = state.prompt.trim();
+      if (imageAttachments.length > 0) {
+        // Codex CLI doesn't recognize @ prefix syntax, use direct paths instead
+        // Claude Code CLI uses @ prefix to reference files
+        const isCodex = state.executionEngineConfig.engine === 'codex';
+        const imagePathMentions = imageAttachments.map(attachment => {
+          if (isCodex) {
+            // For Codex: use direct path without @ prefix
+            return attachment.filePath.includes(' ') ? `"${attachment.filePath}"` : attachment.filePath;
+          } else {
+            // For Claude Code: use @ prefix for file reference
+            return attachment.filePath.includes(' ') ? `@"${attachment.filePath}"` : `@${attachment.filePath}`;
+          }
+        }).join(' ');
+
+        finalPrompt = finalPrompt + (finalPrompt.endsWith(' ') || finalPrompt === '' ? '' : ' ') + imagePathMentions;
+      }
+      onSend(finalPrompt, state.selectedModel, undefined);
+      dispatch({ type: "RESET_INPUT" });
+      setImageAttachments([]);
+      setEmbeddedImages([]);
+      setTimeout(() => {
+        const textarea = state.isExpanded ? expandedTextareaRef.current : textareaRef.current;
+        if (textarea) textarea.style.height = 'auto';
+      }, 0);
+    }
+  };
+
+  const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const newValue = e.target.value;
+    const newCursorPosition = e.target.selectionStart || 0;
+    detectAtSymbol(newValue, newCursorPosition);
+    updateFilePickerQuery(newValue, newCursorPosition);
+    dispatch({ type: "SET_PROMPT", payload: newValue });
+    dispatch({ type: "SET_CURSOR_POSITION", payload: newCursorPosition });
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (showFilePicker && e.key === 'Escape') {
+      e.preventDefault();
+      setShowFilePicker(false);
+      setFilePickerQuery("");
+      return;
+    }
+    // 🔧 Mac 输入法兼容：组合输入时忽略 Enter 键
+    if (e.key === "Enter" && !e.shiftKey && !state.isExpanded && !showFilePicker) {
+      // 三重检查：
+      // 1. isComposing 状态
+      // 2. 原生事件属性
+      // 3. compositionend 后的冷却期（Mac 原生输入法需要）
+      const timeSinceCompositionEnd = Date.now() - compositionEndTimeRef.current;
+      const inCooldown = timeSinceCompositionEnd < 100; // 100ms 冷却期
+
+      if (!isComposing && !e.nativeEvent.isComposing && !inCooldown) {
+        e.preventDefault();
+        handleSend();
+      }
+    }
+  };
+
+  return (
+    <>
+      {/* 🆕 优化预览对话框 */}
+      <PreviewDialog
+        open={!!previewState}
+        originalPrompt={previewState?.originalPrompt || ''}
+        enhancedPrompt={previewState?.enhancedPrompt || ''}
+        providerName={previewState?.providerName}
+        onApply={handleApplyEnhancement}
+        onCancel={cancelEnhancement}
+        onClose={cancelEnhancement}
+      />
+
+      {/* 🆕 优化历史面板 */}
+      <EnhancementHistoryPanel
+        open={showHistoryPanel}
+        history={enhancementHistory}
+        onSelect={handleRestoreFromHistory}
+        onClear={clearHistory}
+        onClose={() => setShowHistoryPanel(false)}
+      />
+
+      {/* Expanded Modal */}
+      <AnimatePresence>
+        {state.isExpanded && (
+          <ExpandedModal
+            ref={expandedTextareaRef}
+            prompt={state.prompt}
+            disabled={disabled}
+            imageAttachments={imageAttachments}
+            embeddedImages={embeddedImages}
+            executionEngineConfig={state.executionEngineConfig}
+            setExecutionEngineConfig={(config) => dispatch({ type: "SET_EXECUTION_ENGINE_CONFIG", payload: config })}
+            selectedModel={state.selectedModel}
+            setSelectedModel={(model) => dispatch({ type: "SET_MODEL", payload: model })}
+            availableModels={availableModels}
+            selectedThinkingMode={state.selectedThinkingMode}
+            handleToggleThinkingMode={handleToggleThinkingMode}
+            isPlanMode={isPlanMode}
+            onTogglePlanMode={onTogglePlanMode}
+            isEnhancing={isEnhancing}
+            projectPath={projectPath}
+            enableProjectContext={state.enableProjectContext}
+            setEnableProjectContext={(enable) => dispatch({ type: "SET_ENABLE_PROJECT_CONTEXT", payload: enable })}
+            enableDualAPI={enableDualAPI}
+            setEnableDualAPI={setEnableDualAPI}
+            getEnabledProviders={getEnabledProviders}
+            handleEnhancePromptWithAPI={handleEnhancePromptWithAPI}
+            onClose={() => dispatch({ type: "SET_EXPANDED", payload: false })}
+            onRemoveAttachment={handleRemoveImageAttachment}
+            onRemoveEmbedded={handleRemoveEmbeddedImage}
+            onTextChange={handleTextChange}
+            onPaste={handlePaste}
+            onDragEnter={handleDrag}
+            onDragLeave={handleDrag}
+            onDragOver={handleDrag}
+            onDrop={handleDrop}
+            onSend={handleSend}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Main Floating Input */}
+      <div
+        className={cn(
+          "fixed bottom-0 z-40 border-t border-[var(--glass-border)] bg-[var(--glass-bg)] backdrop-blur-[var(--glass-blur)] shadow-[var(--glass-shadow)]",
+          "left-0 right-0", // 默认值,可被 className 覆盖
+          className
+        )}
+        style={{
+          '--input-height': '80px'
+        } as React.CSSProperties}
+      >
+        <div className="p-4 space-y-2">
+          {/* 图片预览 - 显示在输入框内部上方 */}
+          {(imageAttachments.length > 0 || embeddedImages.length > 0) && (
+            <AttachmentPreview
+              imageAttachments={imageAttachments}
+              embeddedImages={embeddedImages}
+              onRemoveAttachment={handleRemoveImageAttachment}
+              onRemoveEmbedded={handleRemoveEmbeddedImage}
+              className="mb-1"
+            />
+          )}
+
+          <InputArea
+            ref={textareaRef}
+            prompt={state.prompt}
+            disabled={disabled}
+            dragActive={dragActive}
+            showFilePicker={showFilePicker}
+            projectPath={projectPath}
+            filePickerQuery={filePickerQuery}
+            onTextChange={handleTextChange}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+            onDragEnter={handleDrag}
+            onDragLeave={handleDrag}
+            onDragOver={handleDrag}
+            onDrop={handleDrop}
+            onExpand={() => dispatch({ type: "SET_EXPANDED", payload: true })}
+            onFileSelect={handleFileSelect}
+            onFilePickerClose={handleFilePickerClose}
+            // 🔧 Mac 输入法兼容
+            onCompositionStart={() => setIsComposing(true)}
+            onCompositionEnd={() => {
+              setIsComposing(false);
+              compositionEndTimeRef.current = Date.now(); // 记录时间戳用于冷却期
+            }}
+          />
+
+          <ControlBar
+            disabled={disabled}
+            isLoading={isLoading}
+            prompt={state.prompt}
+            hasAttachments={imageAttachments.length > 0}
+            executionEngineConfig={state.executionEngineConfig}
+            setExecutionEngineConfig={(config) => dispatch({ type: "SET_EXECUTION_ENGINE_CONFIG", payload: config })}
+            selectedModel={state.selectedModel}
+            setSelectedModel={(model) => dispatch({ type: "SET_MODEL", payload: model })}
+            availableModels={availableModels}
+            selectedThinkingMode={state.selectedThinkingMode}
+            handleToggleThinkingMode={handleToggleThinkingMode}
+            isPlanMode={isPlanMode}
+            onTogglePlanMode={onTogglePlanMode}
+            hasMessages={hasMessages}
+            sessionCost={sessionCost}
+            sessionStats={sessionStats}
+            showCostPopover={state.showCostPopover}
+            setShowCostPopover={(show) => dispatch({ type: "SET_SHOW_COST_POPOVER", payload: show })}
+            messages={messages}
+            session={session}
+            isEnhancing={isEnhancing}
+            projectPath={projectPath}
+            enableProjectContext={state.enableProjectContext}
+            setEnableProjectContext={(enable) => dispatch({ type: "SET_ENABLE_PROJECT_CONTEXT", payload: enable })}
+            enableDualAPI={enableDualAPI}
+            setEnableDualAPI={setEnableDualAPI}
+            getEnabledProviders={getEnabledProviders}
+            handleEnhancePromptWithAPI={handleEnhancePromptWithAPI}
+            onCancel={onCancel || (() => {})}
+            onSend={handleSend}
+            // 🆕 新增属性
+            defaultProviderId={defaultProviderId}
+            setDefaultProviderId={setDefaultProviderId}
+            historyCount={enhancementHistory.length}
+            onOpenHistory={() => setShowHistoryPanel(true)}
+            onEnhance={handleEnhanceClick}
+          />
+        </div>
+      </div>
+    </>
+  );
+};
+
+export const FloatingPromptInput = forwardRef(FloatingPromptInputInner);

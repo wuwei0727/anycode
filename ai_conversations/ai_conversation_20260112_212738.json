@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-01-12T21:27:38.130390",
+  "project_directory": "d:\\cusor项目\\Any-code-main\\Any-code-main",
+  "summary": "已移除 OpenAI Official 和 Azure OpenAI 这两个预设，现在预设列表只剩下'自定义供应商'。请重新编译测试确认",
+  "feedback": [
+    {
+      "type": "text",
+      "content": "Codex 代理商默认第一个显示",
+      "timestamp": "2026-01-12T21:27:36.360652"
+    }
+  ],
+  "system_info": {
+    "操作系统": "Windows",
+    "系统版本": "10.0.26100",
+    "架构": "64bit",
+    "处理器": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "Python版本": "3.11.0",
+    "当前工作目录": "D:\\cusor项目\\Any-code-main\\Any-code-main",
+    "用户名": "Admin",
+    "时间戳": "2026-01-12T21:27:38.201143"
+  },
+  "feedback_count": 1,
+  "conversation_id": "20260112_212738"
+}

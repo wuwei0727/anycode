@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-01-12T20:46:11.776566",
+  "project_directory": "d:\\cusor项目\\Any-code-main\\Any-code-main",
+  "summary": "已重构合并逻辑：1) 备份移到读取文件之前确保安全 2) 使用正则匹配model=行(支持各种空格格式) 3) 只移除provider相关配置(model_provider/model_reasoning_effort/disable_response_storage/model=/[model_providers.*]) 4) 保留所有其他用户配置行 5) 新provider配置追加到文件末尾。请重新编译测试，看config.toml.bak是否正确备份，以及用户其他配置是否保留",
+  "feedback": [
+    {
+      "type": "text",
+      "content": "# === Provider Configuration (auto-managed) ===\n\n\n# === Provider Configuration (auto-managed) ===你这个为什么每次切换都会生成这个？保留一个就行了啊。还有就是你这个能不能放最前面？首行啊，但是后面用户的不要清空了啊",
+      "timestamp": "2026-01-12T20:46:10.560842"
+    }
+  ],
+  "system_info": {
+    "操作系统": "Windows",
+    "系统版本": "10.0.26100",
+    "架构": "64bit",
+    "处理器": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "Python版本": "3.11.0",
+    "当前工作目录": "D:\\cusor项目\\Any-code-main\\Any-code-main",
+    "用户名": "Admin",
+    "时间戳": "2026-01-12T20:46:11.820480"
+  },
+  "feedback_count": 1,
+  "conversation_id": "20260112_204611"
+}

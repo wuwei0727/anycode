@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-01-12T19:05:48.848441",
+  "project_directory": "d:\\cusor项目\\Any-code-main\\Any-code-main",
+  "summary": "已更新WSL支持：get_codex_config_dir函数现在会检测WSL模式并使用正确的配置目录。请重启应用后测试：1. 进入设置代理商Codex代理商 2. 切换到第三方模式并填入配置 3. 检查WSL中的~/.codex/auth.json和config.toml是否更新",
+  "feedback": [
+    {
+      "type": "text",
+      "content": "为什么我之前加的配置没有了？我就是重启了下npm start",
+      "timestamp": "2026-01-12T19:05:46.230871"
+    }
+  ],
+  "system_info": {
+    "操作系统": "Windows",
+    "系统版本": "10.0.26100",
+    "架构": "64bit",
+    "处理器": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "Python版本": "3.11.0",
+    "当前工作目录": "D:\\cusor项目\\Any-code-main\\Any-code-main",
+    "用户名": "Admin",
+    "时间戳": "2026-01-12T19:05:48.885941"
+  },
+  "feedback_count": 1,
+  "conversation_id": "20260112_190548"
+}

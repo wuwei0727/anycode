@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-01-12T19:22:05.281226",
+  "project_directory": "d:\\cusor项目\\Any-code-main\\Any-code-main",
+  "summary": "已修改合并逻辑：1) 只合并provider相关的key(model_provider/model/model_providers及model开头的key) 2) 非provider的key只在用户原配置中不存在时才添加 3) 保留用户其他自定义配置不被覆盖",
+  "feedback": [
+    {
+      "type": "text",
+      "content": "你改了吗？切换还是把用户其他配置也替换了，导致用户的没了",
+      "timestamp": "2026-01-12T19:22:04.273828"
+    }
+  ],
+  "system_info": {
+    "操作系统": "Windows",
+    "系统版本": "10.0.26100",
+    "架构": "64bit",
+    "处理器": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "Python版本": "3.11.0",
+    "当前工作目录": "D:\\cusor项目\\Any-code-main\\Any-code-main",
+    "用户名": "Admin",
+    "时间戳": "2026-01-12T19:22:05.329267"
+  },
+  "feedback_count": 1,
+  "conversation_id": "20260112_192205"
+}

@@ -1,0 +1,582 @@
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod claude_binary;
+mod commands;
+mod process;
+
+use claude_binary::init_shell_environment;
+
+use std::sync::{Arc, Mutex};
+
+use commands::acemcp::{
+    enhance_prompt_with_context, test_acemcp_availability,
+    save_acemcp_config, load_acemcp_config, preindex_project,
+    export_acemcp_sidecar, get_extracted_sidecar_path
+};
+use commands::claude::{
+    cancel_claude_execution, check_claude_version, clear_custom_claude_path, continue_claude_code,
+    delete_project, delete_project_permanently, delete_session, delete_sessions_batch,
+    execute_claude_code, find_claude_md_files,
+    get_available_tools, get_claude_execution_config, get_claude_path, get_claude_permission_config,
+    get_claude_session_output, get_claude_settings, get_codex_system_prompt, get_hooks_config, get_permission_presets,
+    get_project_sessions, get_system_prompt, list_directory_contents, list_hidden_projects,
+    list_projects, list_running_claude_sessions, load_session_history, open_new_session,
+    read_claude_md_file, reset_claude_execution_config, restore_project, resume_claude_code,
+    save_claude_md_file, save_claude_settings, save_codex_system_prompt, save_system_prompt, search_files,
+    set_custom_claude_path, update_claude_execution_config, update_claude_permission_config,
+    update_hooks_config, update_thinking_mode, validate_hook_command, validate_permission_config,
+    // Multi-prompt management
+    list_codex_prompts, get_codex_prompt, save_codex_prompt, rename_codex_prompt, delete_codex_prompt,
+    activate_codex_prompt, deactivate_codex_prompt, get_active_codex_prompt_id,
+    // Project-level AGENTS.md management
+    check_project_agents_md, activate_codex_prompt_to_project, deactivate_codex_prompt_from_project,
+    // settings.json file switching (AnyCode)
+    read_claude_settings_json_text, write_claude_settings_json_text,
+    read_claude_json_text, write_claude_json_text, write_claude_config_files,
+    get_claude_settings_file_providers, add_claude_settings_file_provider,
+    update_claude_settings_file_provider, delete_claude_settings_file_provider,
+    ClaudeProcessState,
+};
+use commands::mcp::{
+    mcp_add, mcp_add_from_claude_desktop, mcp_add_json, mcp_export_config, mcp_get,
+    mcp_get_server_status, mcp_list, mcp_read_project_config, mcp_remove,
+    mcp_reset_project_choices, mcp_save_project_config, mcp_serve, mcp_test_connection,
+    // Multi-engine MCP support
+    mcp_list_by_engine, mcp_set_enabled, mcp_add_by_engine, mcp_remove_by_engine, mcp_update_by_engine,
+    mcp_get_project_list, mcp_set_enabled_for_project,
+};
+use commands::storage::{init_database, AgentDb};
+
+use commands::clipboard::{read_from_clipboard, save_clipboard_image, write_to_clipboard};
+use commands::prompt_tracker::{
+    check_rewind_capabilities, get_prompt_list, get_unified_prompt_list, mark_prompt_completed,
+    record_prompt_sent, revert_to_prompt,
+};
+use commands::provider::{
+    add_provider_config, clear_provider_config, delete_provider_config,
+    get_current_provider_config, get_provider_config, get_provider_presets, switch_provider_config,
+    test_provider_connection, update_provider_config,
+};
+use commands::simple_git::check_and_init_git;
+use commands::storage::{
+    storage_analyze_query, storage_delete_row, storage_execute_sql,
+    storage_get_performance_stats, storage_insert_row, storage_list_tables,
+    storage_read_table, storage_reset_database, storage_update_row,
+};
+use commands::translator::{
+    clear_translation_cache, detect_text_language, get_translation_cache_stats,
+    get_translation_config, init_translation_service_command, translate, translate_batch,
+    update_translation_config,
+};
+use commands::usage::{get_session_stats, get_usage_by_date_range, get_usage_stats, get_multi_engine_usage_stats, get_codex_rate_limits};
+use commands::window::{
+    create_session_window, close_session_window, list_session_windows,
+    focus_session_window, emit_to_window, broadcast_to_session_windows,
+};
+
+use commands::enhanced_hooks::{
+    execute_pre_commit_review, test_hook_condition, trigger_hook_event,
+};
+use commands::extensions::{
+    create_skill, create_subagent, list_agent_skills, list_plugins, list_subagents,
+    open_agents_directory, open_plugins_directory, open_skills_directory, read_skill, read_subagent,
+};
+use commands::file_operations::{open_directory_in_explorer, open_file_with_default_app};
+use commands::git_stats::{get_git_diff_stats, get_session_code_changes};
+use commands::codex::{
+    execute_codex, resume_codex, resume_last_codex, cancel_codex,
+    list_codex_sessions, list_codex_sessions_for_project, list_codex_projects,
+    delete_codex_session, load_codex_session_history, get_codex_prompt_list,
+    check_codex_rewind_capabilities, check_codex_availability,
+    set_custom_codex_path, get_codex_path, clear_custom_codex_path,
+    // Codex mode configuration
+    get_codex_mode_config, set_codex_mode_config,
+    // Codex rewind commands
+    record_codex_prompt_sent, record_codex_prompt_completed, revert_codex_to_prompt,
+    // Codex provider management
+    get_codex_provider_presets, get_current_codex_config, switch_codex_provider,
+    add_codex_provider_config, update_codex_provider_config, delete_codex_provider_config,
+    clear_codex_provider_config, test_codex_provider_connection,
+    // Codex provider mode switching
+    get_codex_provider_mode, backup_third_party_auth, backup_official_auth,
+    restore_third_party_auth, restore_official_auth, switch_to_official_mode,
+    switch_to_third_party_mode, open_codex_auth_terminal, check_codex_auth_status,
+    // config.toml file switching (AnyCode)
+    read_codex_config_toml, write_codex_config_toml,
+    read_codex_auth_json_text, write_codex_auth_json_text, write_codex_config_files,
+    get_codex_config_file_providers, add_codex_config_file_provider,
+    update_codex_config_file_provider, delete_codex_config_file_provider,
+    // Session conversion
+    convert_session, convert_claude_to_codex, convert_codex_to_claude,
+    // Codex MCP configuration
+    codex_mcp_list, codex_mcp_set_enabled, codex_mcp_add, codex_mcp_remove,
+    codex_mcp_get_project_list, codex_mcp_set_enabled_for_project, codex_mcp_add_project,
+    // Codex model and reasoning mode selector
+    get_codex_selection_config, save_codex_selection_config, get_default_codex_selection_config,
+    get_available_reasoning_modes, get_available_codex_models, refresh_codex_capabilities,
+    force_refresh_codex_capabilities,
+    // Codex change tracker
+    codex_record_file_change, codex_list_file_changes, codex_get_change_detail,
+    codex_export_patch, codex_export_single_change, codex_clear_change_records,
+    CodexProcessState,
+};
+use commands::engine_status::{
+    check_engine_status,
+    update_engine,
+    check_engine_update,
+};
+use commands::gemini::{
+    execute_gemini, cancel_gemini, check_gemini_installed,
+    get_gemini_config, update_gemini_config, get_gemini_models,
+    get_gemini_session_logs, list_gemini_sessions, get_gemini_session_detail,
+    delete_gemini_session, get_gemini_system_prompt, save_gemini_system_prompt,
+    // Gemini Rewind commands
+    get_gemini_prompt_list, check_gemini_rewind_capabilities,
+    record_gemini_prompt_sent, record_gemini_prompt_completed,
+    revert_gemini_to_prompt,
+    // Gemini Provider commands
+    get_gemini_provider_presets, get_current_gemini_provider_config,
+    switch_gemini_provider, add_gemini_provider_config, update_gemini_provider_config,
+    delete_gemini_provider_config, clear_gemini_provider_config, test_gemini_provider_connection,
+    GeminiProcessState,
+};
+use commands::session_watcher::{
+    start_session_watcher, stop_session_watcher, stop_all_session_watchers,
+    SessionWatcherState,
+};
+use process::ProcessRegistryState;
+use tauri::{Manager, WindowEvent};
+use tauri_plugin_window_state::Builder as WindowStatePlugin;
+
+fn main() {
+    // Initialize logger
+    env_logger::init();
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(
+            tauri_plugin_http::init()
+        )
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(
+            WindowStatePlugin::default()
+                .with_state_flags(tauri_plugin_window_state::StateFlags::all())
+                .build(),
+        )
+        .setup(|app| {
+            // Initialize shell environment for macOS GUI applications
+            // This must be done early to ensure CLI tools (claude, codex, etc.) can be found
+            init_shell_environment();
+
+            // Initialize database for storage operations
+            let conn = init_database(&app.handle()).expect("Failed to initialize database");
+            app.manage(AgentDb(Mutex::new(conn)));
+
+            // Initialize process registry
+            app.manage(ProcessRegistryState::default());
+
+            // Initialize Claude process state
+            app.manage(ClaudeProcessState::default());
+
+            // Initialize Codex process state
+            app.manage(CodexProcessState::default());
+
+            // Initialize Gemini process state
+            app.manage(GeminiProcessState::default());
+
+            // Initialize session watcher state (for real-time sync with external tools)
+            app.manage(SessionWatcherState::default());
+
+            // Initialize auto-compact manager for context management
+            let auto_compact_manager =
+                Arc::new(commands::context_manager::AutoCompactManager::new());
+            let app_handle_for_monitor = app.handle().clone();
+            let manager_for_monitor = auto_compact_manager.clone();
+
+            // Start monitoring in background
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = manager_for_monitor
+                    .start_monitoring(app_handle_for_monitor)
+                    .await
+                {
+                    log::error!("Failed to start auto-compact monitoring: {}", e);
+                }
+            });
+
+            app.manage(commands::context_manager::AutoCompactState(
+                auto_compact_manager,
+            ));
+
+            // Initialize translation service with saved configuration
+            tauri::async_runtime::spawn(async move {
+                commands::translator::init_translation_service_with_saved_config().await;
+            });
+
+            // Fallback window show mechanism for macOS
+            // In case frontend JS fails to execute window.show()
+            if let Some(main_window) = app.get_webview_window("main") {
+                let window_clone = main_window.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Wait for frontend to potentially show the window first
+                    tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
+                    // Show window as fallback (no-op if already visible)
+                    if let Err(e) = window_clone.show() {
+                        log::error!("Fallback: Failed to show main window: {}", e);
+                    }
+                    if let Err(e) = window_clone.set_focus() {
+                        log::error!("Fallback: Failed to focus main window: {}", e);
+                    }
+                    log::info!("Fallback window show mechanism executed");
+                });
+            }
+
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Handle main window close - close all session windows
+            if let WindowEvent::CloseRequested { .. } = event {
+                let window_label = window.label();
+
+                // If main window is closing, close all session windows
+                if window_label == "main" {
+                    log::info!("[Window] Main window closing, closing all session windows");
+
+                    let app = window.app_handle();
+                    let windows_to_close: Vec<String> = app
+                        .webview_windows()
+                        .keys()
+                        .filter(|label| label.starts_with("session-window-"))
+                        .cloned()
+                        .collect();
+
+                    for label in windows_to_close {
+                        if let Some(win) = app.get_webview_window(&label) {
+                            log::info!("[Window] Closing session window: {}", label);
+                            if let Err(e) = win.close() {
+                                log::error!("[Window] Failed to close session window {}: {}", label, e);
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            // Claude & Project Management
+            list_projects,
+            get_project_sessions,
+            delete_session,
+            delete_sessions_batch,
+            delete_project,
+            restore_project,
+            list_hidden_projects,
+            delete_project_permanently,
+            get_claude_settings,
+            // settings.json file switching (AnyCode)
+            read_claude_settings_json_text,
+            write_claude_settings_json_text,
+            read_claude_json_text,
+            write_claude_json_text,
+            write_claude_config_files,
+            get_claude_settings_file_providers,
+            add_claude_settings_file_provider,
+            update_claude_settings_file_provider,
+            delete_claude_settings_file_provider,
+            open_new_session,
+            get_system_prompt,
+            get_codex_system_prompt,
+            check_claude_version,
+            check_engine_status,  // 统一的引擎状态检查
+            update_engine,  // 引擎更新
+            check_engine_update,  // 检查引擎更新
+            save_system_prompt,
+            save_codex_system_prompt,
+            // Multi-prompt management
+            list_codex_prompts,
+            get_codex_prompt,
+            save_codex_prompt,
+            rename_codex_prompt,
+            delete_codex_prompt,
+            activate_codex_prompt,
+            deactivate_codex_prompt,
+            get_active_codex_prompt_id,
+            // Project-level AGENTS.md management
+            check_project_agents_md,
+            activate_codex_prompt_to_project,
+            deactivate_codex_prompt_from_project,
+            save_claude_settings,
+            update_thinking_mode,
+            find_claude_md_files,
+            read_claude_md_file,
+            save_claude_md_file,
+            load_session_history,
+            execute_claude_code,
+            continue_claude_code,
+            resume_claude_code,
+            cancel_claude_execution,
+            list_running_claude_sessions,
+            get_claude_session_output,
+            list_directory_contents,
+            search_files,
+            get_hooks_config,
+            update_hooks_config,
+            validate_hook_command,
+            // 权限管理命令
+            get_claude_execution_config,
+            update_claude_execution_config,
+            reset_claude_execution_config,
+            get_claude_permission_config,
+            update_claude_permission_config,
+            get_permission_presets,
+            get_available_tools,
+            validate_permission_config,
+            set_custom_claude_path,
+            get_claude_path,
+            clear_custom_claude_path,
+            // Acemcp Integration
+            enhance_prompt_with_context,
+            test_acemcp_availability,
+            save_acemcp_config,
+            load_acemcp_config,
+            preindex_project,
+            export_acemcp_sidecar,
+            get_extracted_sidecar_path,
+            // Enhanced Hooks Automation
+            trigger_hook_event,
+            test_hook_condition,
+            execute_pre_commit_review,
+            // Usage & Analytics (Simplified from opcode)
+            get_usage_stats,
+            get_usage_by_date_range,
+            get_session_stats,
+            get_multi_engine_usage_stats,
+            get_codex_rate_limits,
+            // MCP (Model Context Protocol)
+            mcp_add,
+            mcp_list,
+            mcp_get,
+            mcp_remove,
+            mcp_add_json,
+            mcp_add_from_claude_desktop,
+            mcp_serve,
+            mcp_test_connection,
+            mcp_reset_project_choices,
+            mcp_get_server_status,
+            mcp_export_config,
+            mcp_read_project_config,
+            mcp_save_project_config,
+            // Multi-engine MCP support
+            mcp_list_by_engine,
+            mcp_set_enabled,
+            mcp_add_by_engine,
+            mcp_remove_by_engine,
+            mcp_update_by_engine,
+            mcp_get_project_list,
+            mcp_set_enabled_for_project,
+            // Storage Management
+            storage_list_tables,
+            storage_read_table,
+            storage_update_row,
+            storage_delete_row,
+            storage_insert_row,
+            storage_execute_sql,
+            storage_reset_database,
+            storage_get_performance_stats,
+            storage_analyze_query,
+            // Clipboard
+            save_clipboard_image,
+            write_to_clipboard,
+            read_from_clipboard,
+            // Provider Management
+            get_provider_presets,
+            get_current_provider_config,
+            switch_provider_config,
+            clear_provider_config,
+            test_provider_connection,
+            add_provider_config,
+            update_provider_config,
+            delete_provider_config,
+            get_provider_config,
+            // Translation
+            translate,
+            translate_batch,
+            get_translation_config,
+            update_translation_config,
+            clear_translation_cache,
+            get_translation_cache_stats,
+            detect_text_language,
+            init_translation_service_command,
+            // Auto-Compact Context Management
+            commands::context_commands::init_auto_compact_manager,
+            commands::context_commands::register_auto_compact_session,
+            commands::context_commands::update_session_context,
+            commands::context_commands::trigger_manual_compaction,
+            commands::context_commands::get_auto_compact_config,
+            commands::context_commands::update_auto_compact_config,
+            commands::context_commands::get_session_context_stats,
+            commands::context_commands::get_all_monitored_sessions,
+            commands::context_commands::unregister_auto_compact_session,
+            commands::context_commands::stop_auto_compact_monitoring,
+            commands::context_commands::start_auto_compact_monitoring,
+            commands::context_commands::get_auto_compact_status,
+            // Prompt Revert System
+            check_and_init_git,
+            record_prompt_sent,
+            mark_prompt_completed,
+            revert_to_prompt,
+            get_prompt_list,
+            get_unified_prompt_list,
+            check_rewind_capabilities,
+            // Claude Extensions (Plugins, Subagents & Skills)
+            list_plugins,
+            list_subagents,
+            list_agent_skills,
+            read_subagent,
+            read_skill,
+            create_subagent,
+            create_skill,
+            open_plugins_directory,
+            open_agents_directory,
+            open_skills_directory,
+            // File Operations
+            open_directory_in_explorer,
+            open_file_with_default_app,
+            // Git Statistics
+            get_git_diff_stats,
+            get_session_code_changes,
+            // OpenAI Codex Integration
+            execute_codex,
+            resume_codex,
+            resume_last_codex,
+            cancel_codex,
+            list_codex_sessions,
+            list_codex_sessions_for_project,
+            list_codex_projects,
+            delete_codex_session,
+            load_codex_session_history,
+            get_codex_prompt_list,
+            check_codex_rewind_capabilities,
+            check_codex_availability,
+            // Codex Mode Configuration
+            get_codex_mode_config,
+            set_codex_mode_config,
+            // Codex Rewind Commands
+            record_codex_prompt_sent,
+            record_codex_prompt_completed,
+            revert_codex_to_prompt,
+            // Codex custom path
+            set_custom_codex_path,
+            get_codex_path,
+            clear_custom_codex_path,
+            // Codex Provider Management
+            get_codex_provider_presets,
+            get_current_codex_config,
+            switch_codex_provider,
+            add_codex_provider_config,
+            update_codex_provider_config,
+            delete_codex_provider_config,
+            clear_codex_provider_config,
+            test_codex_provider_connection,
+            // Codex Provider Mode Switching
+            get_codex_provider_mode,
+            backup_third_party_auth,
+            backup_official_auth,
+            restore_third_party_auth,
+            restore_official_auth,
+            switch_to_official_mode,
+            switch_to_third_party_mode,
+            open_codex_auth_terminal,
+            check_codex_auth_status,
+            // config.toml file switching (AnyCode)
+            read_codex_config_toml,
+            write_codex_config_toml,
+            read_codex_auth_json_text,
+            write_codex_auth_json_text,
+            write_codex_config_files,
+            get_codex_config_file_providers,
+            add_codex_config_file_provider,
+            update_codex_config_file_provider,
+            delete_codex_config_file_provider,
+            // Session Conversion (Claude ↔ Codex)
+            convert_session,
+            convert_claude_to_codex,
+            convert_codex_to_claude,
+            // Codex MCP Configuration
+            codex_mcp_list,
+            codex_mcp_set_enabled,
+            codex_mcp_add,
+            codex_mcp_remove,
+            codex_mcp_get_project_list,
+            codex_mcp_set_enabled_for_project,
+            codex_mcp_add_project,
+            // Codex Model and Reasoning Mode Selector
+            get_codex_selection_config,
+            save_codex_selection_config,
+            get_default_codex_selection_config,
+            get_available_reasoning_modes,
+            get_available_codex_models,
+            refresh_codex_capabilities,
+            force_refresh_codex_capabilities,
+            // Codex Change Tracker
+            codex_record_file_change,
+            codex_list_file_changes,
+            codex_get_change_detail,
+            codex_export_patch,
+            codex_export_single_change,
+            codex_clear_change_records,
+            // Window Management (Multi-window support)
+            create_session_window,
+            close_session_window,
+            list_session_windows,
+            focus_session_window,
+            emit_to_window,
+            broadcast_to_session_windows,
+            // Google Gemini CLI Integration
+            execute_gemini,
+            cancel_gemini,
+            check_gemini_installed,
+            get_gemini_config,
+            update_gemini_config,
+            get_gemini_models,
+            // Gemini Session History
+            get_gemini_session_logs,
+            list_gemini_sessions,
+            get_gemini_session_detail,
+            delete_gemini_session,
+            // Gemini System Prompt
+            get_gemini_system_prompt,
+            save_gemini_system_prompt,
+            // Gemini Rewind Commands
+            get_gemini_prompt_list,
+            check_gemini_rewind_capabilities,
+            record_gemini_prompt_sent,
+            record_gemini_prompt_completed,
+            revert_gemini_to_prompt,
+            // Gemini Provider Commands
+            get_gemini_provider_presets,
+            get_current_gemini_provider_config,
+            switch_gemini_provider,
+            add_gemini_provider_config,
+            update_gemini_provider_config,
+            delete_gemini_provider_config,
+            clear_gemini_provider_config,
+            test_gemini_provider_connection,
+            // IDE Integration (File Jump)
+            commands::ide::get_ide_config,
+            commands::ide::save_ide_config_cmd,
+            commands::ide::detect_ides,
+            commands::ide::open_file_in_ide,
+            commands::ide::validate_ide_path,
+            // Session File Watcher (Real-time sync with external tools)
+            start_session_watcher,
+            stop_session_watcher,
+            stop_all_session_watchers,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

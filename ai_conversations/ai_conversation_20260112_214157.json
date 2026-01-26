@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-01-12T21:41:57.425668",
+  "project_directory": "d:\\cusor项目\\Any-code-main\\Any-code-main",
+  "summary": "已修改：Windows上打开终端认证时使用 'wsl codex auth login' 而不是直接 'codex auth login'，因为codex是安装在WSL中的。请重新编译测试",
+  "feedback": [
+    {
+      "type": "text",
+      "content": "你是什么模型",
+      "timestamp": "2026-01-12T21:41:55.993374"
+    }
+  ],
+  "system_info": {
+    "操作系统": "Windows",
+    "系统版本": "10.0.26100",
+    "架构": "64bit",
+    "处理器": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "Python版本": "3.11.0",
+    "当前工作目录": "D:\\cusor项目\\Any-code-main\\Any-code-main",
+    "用户名": "Admin",
+    "时间戳": "2026-01-12T21:41:57.472918"
+  },
+  "feedback_count": 1,
+  "conversation_id": "20260112_214157"
+}

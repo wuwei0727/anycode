@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-01-12T21:26:36.127893",
+  "project_directory": "d:\\cusor项目\\Any-code-main\\Any-code-main",
+  "summary": "已完成修改：1) Provider配置放在config.toml最前面 2) 从预设中移除了model_reasoning_effort和disable_response_storage默认配置（修改了generateThirdPartyConfig函数和Azure OpenAI预设）。请重新编译测试确认",
+  "feedback": [
+    {
+      "type": "text",
+      "content": "我的意思是这2个 Azure OpenAI 预设不需要。不是里面的东西",
+      "timestamp": "2026-01-12T21:26:34.204836"
+    }
+  ],
+  "system_info": {
+    "操作系统": "Windows",
+    "系统版本": "10.0.26100",
+    "架构": "64bit",
+    "处理器": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "Python版本": "3.11.0",
+    "当前工作目录": "D:\\cusor项目\\Any-code-main\\Any-code-main",
+    "用户名": "Admin",
+    "时间戳": "2026-01-12T21:26:36.184962"
+  },
+  "feedback_count": 1,
+  "conversation_id": "20260112_212636"
+}

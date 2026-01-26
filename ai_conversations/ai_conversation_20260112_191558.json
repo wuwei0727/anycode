@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-01-12T19:15:58.927902",
+  "project_directory": "d:\\cusor项目\\Any-code-main\\Any-code-main",
+  "summary": "WSL config.toml恢复操作被取消。功能开发已完成：1. 服务商模式切换组件已添加到Codex代理商页面 2. 支持官方/第三方模式切换 3. 支持WSL环境配置更新 4. 修复了maskToken bug。请问还需要什么调整？",
+  "feedback": [
+    {
+      "type": "text",
+      "content": "切换配置的时候你TM的要备份之前的config.toml啊，你个傻逼直接替换啊？改下代码",
+      "timestamp": "2026-01-12T19:15:57.883427"
+    }
+  ],
+  "system_info": {
+    "操作系统": "Windows",
+    "系统版本": "10.0.26100",
+    "架构": "64bit",
+    "处理器": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "Python版本": "3.11.0",
+    "当前工作目录": "D:\\cusor项目\\Any-code-main\\Any-code-main",
+    "用户名": "Admin",
+    "时间戳": "2026-01-12T19:15:58.980162"
+  },
+  "feedback_count": 1,
+  "conversation_id": "20260112_191558"
+}

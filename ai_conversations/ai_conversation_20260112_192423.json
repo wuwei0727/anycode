@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-01-12T19:24:23.366103",
+  "project_directory": "d:\\cusor项目\\Any-code-main\\Any-code-main",
+  "summary": "已彻底重写合并逻辑，改用字符串级别操作：1) 逐行扫描现有config.toml 2) 只移除provider相关的行(model_provider/model=/model_providers/model_reasoning_effort) 3) 跳过[model_providers.*]整个section 4) 保留用户所有其他配置、注释、格式 5) 新provider配置追加到文件末尾",
+  "feedback": [
+    {
+      "type": "text",
+      "content": "还是不行，还是会把用户的全部删除了，你妈的你能不能行了，垃圾玩意",
+      "timestamp": "2026-01-12T19:24:22.488690"
+    }
+  ],
+  "system_info": {
+    "操作系统": "Windows",
+    "系统版本": "10.0.26100",
+    "架构": "64bit",
+    "处理器": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "Python版本": "3.11.0",
+    "当前工作目录": "D:\\cusor项目\\Any-code-main\\Any-code-main",
+    "用户名": "Admin",
+    "时间戳": "2026-01-12T19:24:23.410868"
+  },
+  "feedback_count": 1,
+  "conversation_id": "20260112_192423"
+}
