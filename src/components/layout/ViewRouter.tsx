@@ -406,6 +406,12 @@ export const ViewRouter: React.FC = () => {
         );
 
       case "projects":
+        {
+        const hasSelectedProject = !!(selectedProject || selectedUnifiedProject);
+        const isSessionsLoading = loading && hasSelectedProject;
+        const showSessionSkeleton = isSessionsLoading && sessions.length === 0;
+        const showProjectSkeleton = loading && !hasSelectedProject && filteredProjects.length === 0;
+        const projectListLoading = loading && filteredProjects.length === 0;
         return (
           <div className="flex-1 overflow-y-auto">
             <div className="container mx-auto p-6">
@@ -434,25 +440,25 @@ export const ViewRouter: React.FC = () => {
                 </div>
               )}
 
-              {loading && (
+              {showSessionSkeleton && (
                 <>
-                  {(selectedProject || selectedUnifiedProject) ? (
-                    <div className="border border-border rounded-lg overflow-hidden divide-y divide-border">
-                      {[...Array(8)].map((_, i) => (
-                        <SessionListItemSkeleton key={i} />
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-3">
-                      {[...Array(6)].map((_, i) => (
-                        <ProjectCardSkeleton key={i} />
-                      ))}
-                    </div>
-                  )}
+                  <div className="border border-border rounded-lg overflow-hidden divide-y divide-border">
+                    {[...Array(8)].map((_, i) => (
+                      <SessionListItemSkeleton key={i} />
+                    ))}
+                  </div>
                 </>
               )}
 
-              {!loading && (
+              {showProjectSkeleton && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-3">
+                  {[...Array(6)].map((_, i) => (
+                    <ProjectCardSkeleton key={i} />
+                  ))}
+                </div>
+              )}
+
+              {!showSessionSkeleton && !showProjectSkeleton && (
                 <>
                   {(selectedProject || selectedUnifiedProject) ? (
                     <div>
@@ -466,7 +472,7 @@ export const ViewRouter: React.FC = () => {
                         onSessionConvert={handleSessionConvert}
                         initialEngineFilter={engineFilter}
                         onRefresh={handleRefreshSessions}
-                        isRefreshing={isRefreshingSessions}
+                        isRefreshing={isRefreshingSessions || isSessionsLoading}
                         onSessionClick={(session) => {
                           const result = openSessionInBackground(session);
                           switchToTab(result.tabId);
@@ -506,7 +512,7 @@ export const ViewRouter: React.FC = () => {
                         onProjectDelete={handleUnifiedProjectDelete}
                         onProjectsBatchDelete={handleUnifiedProjectsBatchDelete}
                         onProjectsChanged={loadProjects}
-                        loading={loading}
+                        loading={projectListLoading}
                         engineFilter={engineFilter}
                         onEngineFilterChange={setEngineFilter}
                       />
@@ -517,6 +523,7 @@ export const ViewRouter: React.FC = () => {
             </div>
           </div>
         );
+        }
 
       case "claude-file-editor":
         return viewParams.file ? (

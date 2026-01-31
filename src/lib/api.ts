@@ -830,34 +830,41 @@ export const api = {
    */
   async getProjectSessions(projectId: string, projectPath?: string): Promise<Session[]> {
     try {
-      // Load Claude sessions first to get project path if not provided
-      const claudeSessions = await invoke<Session[]>('get_project_sessions', { projectId });
+      // Always fetch Claude sessions; if projectPath is known, load Codex sessions in parallel.
+      const claudePromise = invoke<Session[]>('get_project_sessions', { projectId });
+      const codexPromise = projectPath
+        ? this.listCodexSessionsForProject(projectPath).catch(err => {
+            console.warn('[SessionList] Failed to load Codex sessions:', err);
+            return [];
+          })
+        : Promise.resolve([] as import('@/types/codex').CodexSession[]);
+
+      const [claudeSessions, codexResults] = await Promise.all([claudePromise, codexPromise]);
       console.log('[SessionList] Claude sessions:', claudeSessions.length);
 
       const targetPath = projectPath || claudeSessions[0]?.project_path;
-      
-      // Load Codex sessions filtered by project path (optimized - only loads matching sessions)
-      let codexSessions: Session[] = [];
-      if (targetPath) {
-        try {
-          const codexResults = await this.listCodexSessionsForProject(targetPath);
-          console.log('[SessionList] Codex sessions for project:', codexResults.length);
-          
-          codexSessions = codexResults.map(cs => ({
-            id: cs.id,
-            project_id: projectId,
-            project_path: cs.projectPath,
-            created_at: cs.createdAt,
-            model: cs.model || 'gpt-5.1-codex-max',
-            engine: 'codex' as const,
-            first_message: cs.firstMessage || `Codex Session`,
-            last_assistant_message: cs.lastAssistantMessage,
-            last_message_timestamp: cs.lastMessageTimestamp,
-          }));
-        } catch (err) {
-          console.warn('[SessionList] Failed to load Codex sessions:', err);
-        }
-      }
+
+      // If projectPath wasn't provided and we now have it, fetch Codex sessions (fallback)
+      const resolvedCodexResults = codexResults.length
+        ? codexResults
+        : targetPath
+          ? await this.listCodexSessionsForProject(targetPath).catch(err => {
+              console.warn('[SessionList] Failed to load Codex sessions:', err);
+              return [];
+            })
+          : [];
+
+      const codexSessions: Session[] = resolvedCodexResults.map(cs => ({
+        id: cs.id,
+        project_id: projectId,
+        project_path: cs.projectPath,
+        created_at: cs.createdAt,
+        model: cs.model || 'gpt-5.1-codex-max',
+        engine: 'codex' as const,
+        first_message: cs.firstMessage || `Codex Session`,
+        last_assistant_message: cs.lastAssistantMessage,
+        last_message_timestamp: cs.lastMessageTimestamp,
+      }));
 
       // Merge and sort by creation time
       const allSessions = [...claudeSessions.map(s => ({ ...s, engine: 'claude' as const })), ...codexSessions];
@@ -1876,7 +1883,10 @@ export const api = {
     promptIndex: number,
     promptText: string,
     newContent: string,
-    oldContent: string | null
+    oldContent: string | null,
+    toolName?: string | null,
+    toolCallId?: string | null,
+    diffHint?: string | null
   ): Promise<string> {
     try {
       return await invoke<string>("codex_record_file_change", {
@@ -1889,6 +1899,9 @@ export const api = {
         promptText,
         newContent,
         oldContent,
+        toolName,
+        toolCallId,
+        diffHint,
       });
     } catch (error) {
       console.error("Failed to record Codex file change:", error);

@@ -102,6 +102,9 @@ const sanitizeFirstMessageForPreview = (text: string): string => {
   // Remove permission instructions block (system-injected)
   result = result.replace(/<permissions instructions>[\s\S]*?<\/permissions instructions>/gi, '');
 
+  // Remove internal "turn aborted" markers (from interrupted streaming)
+  result = result.replace(/<turn_aborted[^>]*>[\s\S]*?<\/turn_aborted>/gi, '');
+
   // Codex "IDE context" wrapper: keep only user request
   if (result.includes('# Context from my IDE setup:') && result.includes('## My request for Codex:')) {
     const requestMarker = '## My request for Codex:';

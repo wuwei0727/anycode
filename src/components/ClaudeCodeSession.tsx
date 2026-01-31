@@ -98,6 +98,10 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
   } = useMessagesContext();
   const isLoading = isStreaming;
   const setIsLoading = setIsStreaming;
+  const [externalIsStreaming, setExternalIsStreaming] = useState(false);
+  // Treat external file-watcher streams as "streaming" for message rendering + auto-scroll,
+  // but keep `isLoading` for local execution state (cancel, session lifecycle, etc.).
+  const isChatStreaming = isLoading || externalIsStreaming;
   const [error, setError] = useState<string | null>(null);
   const [_rawJsonlOutput, setRawJsonlOutput] = useState<string[]>([]); // Kept for hooks, not directly used
   const [isFirstPrompt, setIsFirstPrompt] = useState(!session); // Key state for session continuation
@@ -180,6 +184,7 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
     engine: string;
     source: ExternalQueuedPromptEvent['source'];
     message?: ClaudeStreamMessage;
+    displayedInline?: boolean;
   }>>([]);
 
   // State for revert prompt picker (defined early for useKeyboardShortcuts)
@@ -246,7 +251,7 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
   const { parentRef, userScrolled, setUserScrolled, setShouldAutoScroll } =
     useSmartAutoScroll({
       displayableMessages,
-      isLoading,
+      isLoading: isChatStreaming,
       sessionId: session?.id
     });
 
@@ -294,6 +299,7 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
         engine: evt.engine,
         source: evt.source,
         message: evt.message,
+        displayedInline: evt.displayedInline,
       },
     ]);
   }, []);
@@ -316,9 +322,16 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
       (p) => p.engine === engine && p.source === 'suppressed_user_message'
     );
 
-    const msgs = suppressed.map((p) => p.message).filter(Boolean) as ClaudeStreamMessage[];
+    const msgs = suppressed
+      .filter((p) => !p.displayedInline)
+      .map((p) => p.message)
+      .filter(Boolean) as ClaudeStreamMessage[];
     if (msgs.length > 0) {
-      setMessages((prev) => [...prev, ...msgs]);
+      setMessages((prev) => {
+        const next = msgs.filter((msg) => !prev.includes(msg));
+        if (next.length === 0) return prev;
+        return [...prev, ...next];
+      });
     }
 
     // Remove only suppressed ones; keep 'enqueue' queue items (they'll be dequeued later)
@@ -368,6 +381,9 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
     isMountedRef,
     setMessages,
     isStreaming,
+    onExternalStreamStatusChange: (isExternalStreaming) => {
+      setExternalIsStreaming(isExternalStreaming);
+    },
     onExternalQueuedPrompt: enqueueExternalPrompt,
     onExternalDequeued: dequeueExternalPrompt,
     onExternalStreamComplete: flushSuppressedExternalPrompts,
@@ -429,6 +445,7 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
   const { handleSendPrompt } = usePromptExecution({
     projectPath,
     isLoading,
+    externalIsStreaming,
     claudeSessionId,
     effectiveSession,
     isPlanMode,
@@ -822,7 +839,9 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
       if (
         text.includes('<environment_context>') ||
         text.includes('# AGENTS.md instructions') ||
-        text.includes('<permissions instructions>')
+        text.includes('<permissions instructions>') ||
+        // Internal "turn aborted" markers (from interrupted streaming) should not count as prompts.
+        text.toLowerCase().includes('<turn_aborted')
       ) return;
 
       // 排除自动发送的 Warmup 和 Skills 消息
@@ -1536,7 +1555,7 @@ const ClaudeCodeSessionInner: React.FC<ClaudeCodeSessionProps> = ({
       <SessionMessages
         ref={sessionMessagesRef}
         messageGroups={messageGroups}
-        isLoading={isLoading}
+        isLoading={isChatStreaming}
         claudeSettings={claudeSettings}
         effectiveSession={effectiveSession}
         getPromptIndexForMessage={getPromptIndexForMessage}

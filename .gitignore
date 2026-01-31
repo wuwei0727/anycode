@@ -97,5 +97,7 @@ AGENTS.md
 .claude.json
 aaaa.html
 CLAUDE.md
+ui-lab/**
+tsconfig.node.tsbuildinfo
 
-
+roll**.jsonl

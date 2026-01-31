@@ -78,6 +78,7 @@ pub use self::hooks::{
     validate_hook_command,
 };
 use self::project_store::ProjectStore;
+use tauri::async_runtime;
 pub use file_ops::{list_directory_contents, search_files};
 // Agent functionality removed
 
@@ -86,15 +87,23 @@ pub use file_ops::{list_directory_contents, search_files};
 
 #[tauri::command]
 pub async fn list_projects() -> Result<Vec<Project>, String> {
-    let store = ProjectStore::new()?;
-    store.list_projects()
+    async_runtime::spawn_blocking(|| {
+        let store = ProjectStore::new()?;
+        store.list_projects()
+    })
+    .await
+    .map_err(|e| format!("Failed to load projects: {}", e))?
 }
 
 /// Gets sessions for a specific project
 #[tauri::command]
 pub async fn get_project_sessions(project_id: String) -> Result<Vec<Session>, String> {
-    let store = ProjectStore::new()?;
-    store.get_project_sessions(&project_id)
+    async_runtime::spawn_blocking(move || {
+        let store = ProjectStore::new()?;
+        store.get_project_sessions(&project_id)
+    })
+    .await
+    .map_err(|e| format!("Failed to load sessions: {}", e))?
 }
 
 /// Deletes a session and all its associated data

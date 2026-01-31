@@ -44,11 +44,18 @@ export const ChangedFilesSummary: React.FC<ChangedFilesSummaryProps> = ({
 
   if (!files || files.length === 0) return null;
 
-  const headerText =
-    title ||
-    `${stats.changed} files changed` +
-      (stats.added ? ` +${stats.added}` : "") +
-      (stats.removed ? ` -${stats.removed}` : "");
+  const headerText = useMemo(() => {
+    if (title) return title;
+    const fileLabel = stats.changed === 1 ? "file" : "files";
+    // When there's only one file, the per-row badges already show the exact +/-.
+    // Avoid repeating the same numbers twice in the header.
+    const showTotals = stats.changed !== 1;
+    return (
+      `${stats.changed} ${fileLabel} changed` +
+      (showTotals && stats.added ? ` +${stats.added}` : "") +
+      (showTotals && stats.removed ? ` -${stats.removed}` : "")
+    );
+  }, [stats.added, stats.changed, stats.removed, title]);
 
   return (
     <div className={cn("rounded-lg border border-border/60 overflow-hidden bg-muted/10", className)}>

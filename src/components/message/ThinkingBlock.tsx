@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import { BrainCircuit, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useTypewriter } from "@/hooks/useTypewriter";
@@ -38,15 +38,36 @@ export const ThinkingBlock: React.FC<ThinkingBlockProps> = ({
   // 是否用户手动操作过（手动操作后不再自动收起）
   const userInteractedRef = useRef(false);
 
-  // 打字机效果完成回调
-  const handleTypewriterComplete = useCallback(() => {
-    // 如果用户已手动操作，不自动收起
-    if (userInteractedRef.current) return;
+  // 对短的“进度更新”不要打字机，避免看起来不及时（VSCode 插件是即时刷新）
+  const shouldTypewriter = content.length >= 160;
+  const enableTypewriter = isStreaming && shouldTypewriter;
 
-    // 如果已经自动收起过，不重复
+  // 使用打字机效果
+  const {
+    displayedText,
+    isTyping,
+    skipToEnd
+  } = useTypewriter(content, {
+    enabled: enableTypewriter,
+    speed: typewriterSpeed,
+    isStreaming: enableTypewriter
+  });
+
+  // 显示的文本内容
+  const textToDisplay = enableTypewriter ? displayedText : content;
+
+  // 历史消息的初始状态已在 useState 中处理，无需额外 useEffect
+
+  // 流式结束（或该消息不再是最后一条）后自动收起
+  const prevStreamingRef = useRef(isStreaming);
+  useEffect(() => {
+    const wasStreaming = prevStreamingRef.current;
+    prevStreamingRef.current = isStreaming;
+
+    if (!wasStreaming || isStreaming) return;
+    if (userInteractedRef.current) return;
     if (hasAutoCollapsedRef.current) return;
 
-    // 延迟后自动收起
     const timer = setTimeout(() => {
       if (!userInteractedRef.current) {
         setIsOpen(false);
@@ -55,24 +76,7 @@ export const ThinkingBlock: React.FC<ThinkingBlockProps> = ({
     }, autoCollapseDelay);
 
     return () => clearTimeout(timer);
-  }, [autoCollapseDelay]);
-
-  // 使用打字机效果
-  const {
-    displayedText,
-    isTyping,
-    skipToEnd
-  } = useTypewriter(content, {
-    enabled: isStreaming,
-    speed: typewriterSpeed,
-    isStreaming,
-    onComplete: handleTypewriterComplete
-  });
-
-  // 显示的文本内容
-  const textToDisplay = isStreaming ? displayedText : content;
-
-  // 历史消息的初始状态已在 useState 中处理，无需额外 useEffect
+  }, [isStreaming, autoCollapseDelay]);
 
   // 用户点击切换展开/收起
   const handleToggle = () => {

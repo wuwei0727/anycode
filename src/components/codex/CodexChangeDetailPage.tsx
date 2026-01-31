@@ -7,7 +7,7 @@
  * - 左右对照（before / after）
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowLeft, Copy, FileDown, Loader2, X } from 'lucide-react';
 import * as Diff from 'diff';
@@ -17,6 +17,8 @@ import { api } from '@/lib/api';
 import type { CodexFileChange } from '@/types/codex-changes';
 import { FilePathLink } from '@/components/common/FilePathLink';
 import { useTheme } from '@/contexts/ThemeContext';
+import { CodexEventConverter } from '@/lib/codexConverter';
+import { extractOldNewFromPatchText } from '@/lib/codexDiff';
 
 const GitDiffView = React.lazy(() => import('./GitDiffView'));
 
@@ -97,6 +99,21 @@ const buildRawRows = (oldText: string, newText: string): RawRow[] => {
   return rows;
 };
 
+const normalizeForCompare = (value: string, projectPath?: string): string => {
+  if (!value) return value;
+  const v = value.replace(/\\/g, "/").replace(/^\.\//, "").trim();
+  const isWindows = /^[A-Z]:/i.test(projectPath || "");
+  return isWindows ? v.toLowerCase() : v;
+};
+
+const matchesFile = (candidatePath: string, wantedPath: string, projectPath?: string): boolean => {
+  const cand = normalizeForCompare(candidatePath, projectPath);
+  const want = normalizeForCompare(wantedPath, projectPath);
+  if (!cand || !want) return false;
+  if (cand === want) return true;
+  return cand.endsWith(`/${want}`);
+};
+
 export const CodexChangeDetailPage: React.FC<CodexChangeDetailPageProps> = ({
   sessionId,
   changeId,
@@ -111,6 +128,7 @@ export const CodexChangeDetailPage: React.FC<CodexChangeDetailPageProps> = ({
   const [change, setChange] = useState<CodexFileChange | null>(initialChange || null);
   const [copied, setCopied] = useState(false);
   const { theme } = useTheme();
+  const hydratedFromHistoryRef = useRef(false);
 
   // ESC 关闭 + 禁用 body 滚动
   useEffect(() => {
@@ -155,6 +173,136 @@ export const CodexChangeDetailPage: React.FC<CodexChangeDetailPageProps> = ({
     };
   }, [sessionId, changeId, disableFetch]);
 
+  // Fallback: try to reconstruct tool-level diff when recorded content is missing
+  useEffect(() => {
+    // Fast path: if we only have a patch/unified diff, try to extract before/after snippets
+    // so we can still render the double-column diff viewer.
+    if (!change) return;
+    if (change.old_content || change.new_content) return;
+    if (!change.unified_diff) return;
+
+    const patchDiff = extractOldNewFromPatchText(change.unified_diff);
+    if (!patchDiff) return;
+    if (!patchDiff.oldText && !patchDiff.newText) return;
+
+    setChange((prev) => {
+      if (!prev) return prev;
+      if (prev.old_content || prev.new_content) return prev;
+      return {
+        ...prev,
+        old_content: patchDiff.oldText,
+        new_content: patchDiff.newText,
+      };
+    });
+  }, [change?.old_content, change?.new_content, change?.unified_diff]);
+
+  // Fallback: try to reconstruct tool-level diff from session history when recorded content is missing
+  useEffect(() => {
+    if (!change || hydratedFromHistoryRef.current) return;
+    if (change.source !== 'tool') return;
+    if (!change.file_path) return;
+    if (change.prompt_index < 0) return;
+    if (change.old_content || change.new_content) return;
+
+    let mounted = true;
+    hydratedFromHistoryRef.current = true;
+
+    (async () => {
+      try {
+        const events = await api.loadCodexSessionHistory(sessionId);
+        const converter = new CodexEventConverter();
+        let promptIndex = -1;
+        let best: { oldText: string; newText: string } | null = null;
+
+        for (const event of events) {
+          const msg = converter.convertEventObject(event as any);
+          if (!msg) continue;
+
+          if (msg.type === 'user') {
+            promptIndex += 1;
+            continue;
+          }
+
+          if (promptIndex !== change.prompt_index) {
+            continue;
+          }
+
+          if (msg.type !== 'assistant' || !Array.isArray(msg.message?.content)) {
+            continue;
+          }
+
+          for (const block of msg.message.content as any[]) {
+            if (block?.type !== 'tool_use') continue;
+            const name = String(block?.name || '').toLowerCase();
+            const input = block?.input || {};
+            const fp = input.file_path || input.path || input.file || input.filename || '';
+            if (!fp || !matchesFile(fp, change.file_path, projectPath)) continue;
+
+            const patchText =
+              typeof input?.patch === 'string'
+                ? input.patch
+                : typeof input?.diff === 'string'
+                ? input.diff
+                : typeof input?.raw_input === 'string'
+                ? input.raw_input
+                : '';
+            const patchDiff = patchText ? extractOldNewFromPatchText(patchText) : null;
+
+            if (name === 'edit') {
+              let oldText = typeof input.old_string === 'string' ? input.old_string : '';
+              let newText = typeof input.new_string === 'string' ? input.new_string : '';
+              if ((!oldText || !newText) && patchDiff) {
+                if (!oldText) oldText = patchDiff.oldText || oldText;
+                if (!newText) newText = patchDiff.newText || newText;
+              }
+              if (oldText || newText) {
+                best = { oldText, newText };
+              }
+            } else if (name === 'multiedit') {
+              const edits = Array.isArray(input.edits) ? input.edits : [];
+              for (const e of edits) {
+                const oldText = typeof e?.old_string === 'string' ? e.old_string : '';
+                const newText = typeof e?.new_string === 'string' ? e.new_string : '';
+                if (oldText || newText) {
+                  best = { oldText, newText };
+                }
+              }
+              if (!best && patchDiff) {
+                if (patchDiff.oldText || patchDiff.newText) {
+                  best = { oldText: patchDiff.oldText, newText: patchDiff.newText };
+                }
+              }
+            } else if (name === 'write') {
+              const newText = typeof input.content === 'string' ? input.content : patchDiff?.newText || '';
+              if (newText) {
+                best = { oldText: '', newText };
+              }
+            } else if (patchDiff && (patchDiff.oldText || patchDiff.newText)) {
+              best = { oldText: patchDiff.oldText, newText: patchDiff.newText };
+            }
+          }
+        }
+
+        if (mounted && best) {
+          setChange((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              old_content: best.oldText,
+              new_content: best.newText,
+            };
+          });
+        }
+      } catch (err) {
+        console.warn('[CodexChangeDetailPage] Failed to hydrate tool diff from history:', err);
+      }
+    })();
+
+    return () => {
+      mounted = false;
+    };
+  }, [change, sessionId, projectPath]);
+
   const normalizedPath = (change?.file_path || '').replace(/\\/g, '/');
   const pathParts = normalizedPath.split('/').filter(Boolean);
   const fileName = pathParts[pathParts.length - 1] || change?.file_path || '';
@@ -177,6 +325,18 @@ export const CodexChangeDetailPage: React.FC<CodexChangeDetailPageProps> = ({
   }, [rawRows]);
 
   const stats = useMemo(() => {
+    // If we only have unified_diff (e.g. aggregated multi-tool-call diffs),
+    // prefer backend-provided +/- so the header stays accurate.
+    if (
+      !oldText &&
+      !newText &&
+      change?.unified_diff &&
+      typeof change.lines_added === 'number' &&
+      typeof change.lines_removed === 'number'
+    ) {
+      return { added: change.lines_added, removed: change.lines_removed };
+    }
+
     return numberedRows.reduce(
       (acc, row) => {
         if (row.kind === 'added') acc.added += 1;
@@ -189,7 +349,7 @@ export const CodexChangeDetailPage: React.FC<CodexChangeDetailPageProps> = ({
       },
       { added: 0, removed: 0 }
     );
-  }, [numberedRows]);
+  }, [change?.lines_added, change?.lines_removed, change?.unified_diff, numberedRows, oldText, newText]);
 
   const handleCopy = async () => {
     const text = change?.unified_diff || '';

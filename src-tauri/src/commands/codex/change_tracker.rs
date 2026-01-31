@@ -130,6 +130,59 @@ fn get_change_records_path(session_id: &str) -> Result<PathBuf, String> {
     Ok(dir.join(format!("{}.json", session_id)))
 }
 
+/// Truncate change records after a specific prompt index (inclusive).
+///
+/// This is important when the session is truncated (rewind/revert conversation),
+/// otherwise stale change entries for prompts that no longer exist will remain
+/// and break "files changed" + history ordering.
+pub fn truncate_change_records_after_prompt(session_id: &str, prompt_index: i32) -> Result<usize, String> {
+    let path = get_change_records_path(session_id)?;
+
+    // Load records from memory first, then file.
+    let mut records: Option<CodexChangeRecords> = {
+        let trackers = CHANGE_TRACKERS.lock().unwrap();
+        trackers.get(session_id).cloned()
+    };
+
+    if records.is_none() && path.exists() {
+        let content = fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {}", e))?;
+        let parsed: CodexChangeRecords =
+            serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {}", e))?;
+        records = Some(parsed);
+    }
+
+    let Some(mut records) = records else {
+        return Ok(0);
+    };
+
+    let before_len = records.changes.len();
+    records.changes.retain(|c| c.prompt_index <= prompt_index);
+    let removed = before_len.saturating_sub(records.changes.len());
+
+    if removed == 0 {
+        return Ok(0);
+    }
+
+    records.updated_at = Utc::now().to_rfc3339();
+
+    // Persist to disk (even if the tracker wasn't initialized in-memory).
+    let content = serde_json::to_string_pretty(&records).map_err(|e| format!("序列化失败: {}", e))?;
+    fs::write(&path, content).map_err(|e| format!("写入文件失败: {}", e))?;
+
+    // Update in-memory cache.
+    let mut trackers = CHANGE_TRACKERS.lock().unwrap();
+    trackers.insert(session_id.to_string(), records);
+
+    log::info!(
+        "[ChangeTracker] Truncated change records for session {} to prompt_index <= {} (removed {})",
+        session_id,
+        prompt_index,
+        removed
+    );
+
+    Ok(removed)
+}
+
 // ============================================================================
 // Path & Git Helpers (for full-context diffs)
 // ============================================================================
@@ -412,6 +465,7 @@ pub fn record_file_change(
     new_content: Option<String>,
     tool_name: Option<String>,
     tool_call_id: Option<String>,
+    diff_hint: Option<String>,
     command: Option<String>,
 ) -> Result<String, String> {
     let mut trackers = CHANGE_TRACKERS.lock().unwrap();
@@ -424,6 +478,12 @@ pub fn record_file_change(
     let normalized_file_path = normalize_file_path_for_record(&records.project_path, file_path);
 
     // Prefer Git commit snapshot for "before" content so diffs are stable even if we missed timing.
+    //
+    // NOTE: For tool-based changes the UI may send patch fragments (old_string/new_string). We still
+    // store a *net* per-file diff (like the official plugin) by preferring full-context sources:
+    // - commit_before (if present)
+    // - UI-provided snapshot (usually a disk read taken before tool execution)
+    // - HEAD (best-effort fallback when git records are missing or UI only has a fragment)
     let old_from_git = get_commit_before_for_prompt(session_id, prompt_index)
         .and_then(|commit| git_show_file(&records.project_path, &commit, &normalized_file_path));
 
@@ -435,15 +495,88 @@ pub fn record_file_change(
         read_text_best_effort(&full)
     };
 
-    let final_old = old_from_git.or(old_content);
-    let final_new = new_from_disk.or(new_content);
+    let normalized_old = old_content.filter(|s| !s.trim().is_empty());
+    let normalized_new = new_content.filter(|s| !s.trim().is_empty());
 
-    // Recalculate change_type based on final old/new (fixes misclassified "auto" writes).
-    let effective_change_type = match (&final_old, &final_new) {
-        (None, Some(_)) => ChangeType::Create,
-        (Some(_), Some(_)) => ChangeType::Update,
-        (Some(_), None) => ChangeType::Delete,
-        (None, None) => change_type,
+    // If the UI only captured a small fragment for old_content (common for edit tools),
+    // prefer reading the full base from HEAD so we don't produce a giant "everything changed" diff.
+    //
+    // IMPORTANT: the frontend may send `new_content` as a fragment (e.g. edit old_string/new_string)
+    // while we can still read the full "after" file from disk here. Use the disk snapshot to detect
+    // fragment diffs more reliably.
+    let new_for_fragment = new_from_disk.as_ref().or(normalized_new.as_ref());
+    let old_is_fragment = source == ChangeSource::Tool
+        && match (normalized_old.as_deref(), new_for_fragment.map(|s| s.as_str())) {
+            (Some(old), Some(new)) => looks_like_fragment_text(old, new),
+            _ => false,
+        };
+    let old_from_head = if old_from_git.is_none() && (normalized_old.is_none() || old_is_fragment) {
+        git_show_file(&records.project_path, "HEAD", &normalized_file_path)
+    } else {
+        None
+    };
+
+    // If we can't compute a reliable full-context diff (e.g. missing old snapshot) but we do have
+    // a tool-provided patch/diff hint, prefer that for +/- stats and detail rendering.
+    let diff_hint = diff_hint
+        .and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        });
+    let has_tool_diff_hint = diff_hint.is_some();
+    let tool_patch_diff = if source == ChangeSource::Tool && change_type == ChangeType::Update {
+        if let Some(hint) = diff_hint.clone() {
+            Some(hint)
+        } else {
+            let old_text = normalized_old.as_deref().unwrap_or("");
+            let new_text = normalized_new.as_deref().unwrap_or("");
+            if old_text.is_empty() && new_text.is_empty() {
+                None
+            } else {
+                Some(generate_unified_diff(&normalized_file_path, old_text, new_text))
+            }
+        }
+    } else {
+        diff_hint.clone()
+    };
+    let tool_patch_available = tool_patch_diff.is_some();
+
+    // Final contents used to generate diff stats.
+    //
+    // For tool-driven edits, the frontend captures a "before" snapshot from disk right before
+    // the tool executes. That snapshot is the most accurate base for "files changed" because:
+    // - the working tree may already be dirty (manual edits before the prompt)
+    // - git commit_before may not include uncommitted state
+    //
+    // So we prefer the UI-provided snapshot when it looks like full context.
+    // For command-driven changes (shell), we still prefer git snapshots when available.
+    let normalized_old_missing = normalized_old.is_none();
+    let final_old = if old_is_fragment {
+        old_from_git.or(old_from_head).or(normalized_old)
+    } else if source == ChangeSource::Tool {
+        normalized_old.or(old_from_git).or(old_from_head)
+    } else {
+        old_from_git.or(normalized_old).or(old_from_head)
+    };
+    let final_new = new_from_disk.or(normalized_new);
+
+    let prefer_tool_patch = source == ChangeSource::Tool
+        && change_type == ChangeType::Update
+        && tool_patch_available
+        // Prefer patch hints only when we don't trust the snapshot (fragment / missing before).
+        && (has_tool_diff_hint || old_is_fragment || normalized_old_missing || final_new.is_none());
+
+    // For tool changes, the frontend already decides create/update/delete based on tool metadata.
+    // Avoid auto-reclassifying updates to "create" when we failed to snapshot old_content.
+    let effective_change_type = if source == ChangeSource::Tool {
+        change_type
+    } else {
+        match (&final_old, &final_new) {
+            (None, Some(_)) => ChangeType::Create,
+            (Some(_), Some(_)) => ChangeType::Update,
+            (Some(_), None) => ChangeType::Delete,
+            (None, None) => change_type,
+        }
     };
 
     // =========================================================================
@@ -461,71 +594,108 @@ pub fn record_file_change(
     {
         let now = Utc::now().to_rfc3339();
 
-        // Preserve the earliest old_content; always update to the latest new_content.
-        let mut merged_old = if existing.old_content.is_some() {
-            existing.old_content.clone()
-        } else {
-            final_old.clone()
-        };
-        let mut merged_new = final_new.clone();
+        // Tool changes may contain multiple tool calls for the same file within one prompt.
+        // Keep a comma-separated list of tool_call_id values for reliable UI matching, and
+        // avoid double-recording the same tool call.
+        if source == ChangeSource::Tool {
+            if let Some(incoming_call_id) = tool_call_id.clone() {
+                let already_recorded = existing
+                    .tool_call_id
+                    .as_deref()
+                    .map(|s| {
+                        s.split(',')
+                            .map(|p| p.trim())
+                            .filter(|p| !p.is_empty())
+                            .any(|p| p == incoming_call_id.as_str())
+                    })
+                    .unwrap_or(false);
+
+                if already_recorded {
+                    return Ok(existing.id.clone());
+                }
+
+                existing.tool_call_id = match existing.tool_call_id.as_deref() {
+                    None => Some(incoming_call_id.clone()),
+                    Some(s) if s.trim().is_empty() => Some(incoming_call_id.clone()),
+                    Some(s) => Some(format!("{},{}", s, incoming_call_id)),
+                };
+            }
+        } else if tool_call_id.is_some() {
+            existing.tool_call_id = tool_call_id;
+        }
+
+        // Preserve the earliest old_content (prompt base); always update to the latest new_content (prompt latest).
+        //
+        // If existing old_content is clearly a small fragment (legacy), prefer a larger full-context `final_old`.
+        if existing.old_content.is_none() {
+            existing.old_content = final_old.clone();
+        } else if let (Some(prev), Some(next)) = (existing.old_content.as_ref(), final_old.as_ref()) {
+            let prev_trim = prev.trim();
+            let next_trim = next.trim();
+            let prev_len = prev_trim.len();
+            let next_len = next_trim.len();
+            let should_upgrade_old = prev_len > 0 && next_len > 0 && prev_len < 1_000 && next_len > prev_len * 5;
+            if should_upgrade_old {
+                existing.old_content = Some(next.clone());
+            }
+        }
+        existing.new_content = final_new.clone();
 
         // Decide final change type for the merged record.
+        // (Create->Update stays Create; any Delete wins.)
         let mut merged_type = existing.change_type.clone();
         match (&existing.change_type, &effective_change_type) {
             (ChangeType::Create, ChangeType::Update) => merged_type = ChangeType::Create,
-            (ChangeType::Create, ChangeType::Delete) => {
-                // Create -> Delete within the same prompt: treat as Delete (best-effort).
-                // Use the created content as old_content so diff is viewable.
-                merged_type = ChangeType::Delete;
-                if merged_old.is_none() {
-                    merged_old = existing.new_content.clone().or(final_old.clone());
-                }
-                merged_new = None;
-            }
-            (_, ChangeType::Delete) => {
-                merged_type = ChangeType::Delete;
-                merged_new = None;
-            }
+            (ChangeType::Create, ChangeType::Delete) => merged_type = ChangeType::Delete,
+            (_, ChangeType::Delete) => merged_type = ChangeType::Delete,
             (ChangeType::Delete, _) => merged_type = ChangeType::Delete,
-            _ => {
-                // Update stays Update, Create stays Create
-                merged_type = existing.change_type.clone();
-            }
+            _ => merged_type = existing.change_type.clone(),
         }
-
-        // Recompute diff stats based on merged old/new.
-        let (unified_diff, lines_added, lines_removed) = match (&merged_old, &merged_new) {
-            (Some(old), Some(new)) => {
-                let diff = generate_unified_diff(&normalized_file_path, old, new);
-                let (added, removed) = count_diff_lines(&diff);
-                (Some(diff), Some(added), Some(removed))
-            }
-            (None, Some(new)) => {
-                let lines = new.lines().count() as i32;
-                let diff = generate_create_diff(&normalized_file_path, new);
-                (Some(diff), Some(lines), Some(0))
-            }
-            (Some(old), None) => {
-                let lines = old.lines().count() as i32;
-                let diff = generate_delete_diff(&normalized_file_path, old);
-                (Some(diff), Some(0), Some(lines))
-            }
-            (None, None) => (None, None, None),
-        };
 
         existing.timestamp = now.clone();
         existing.change_type = merged_type;
-        existing.old_content = merged_old;
-        existing.new_content = merged_new;
-        existing.unified_diff = unified_diff;
-        existing.lines_added = lines_added;
-        existing.lines_removed = lines_removed;
+
+        // Recompute diff stats based on merged old/new (net diff per file per prompt), but fall back to
+        // tool diff hint when we don't have a reliable snapshot.
+        let mut has_full_context = match existing.change_type {
+            ChangeType::Create => existing.new_content.is_some(),
+            ChangeType::Delete => existing.old_content.is_some(),
+            ChangeType::Update => existing.old_content.is_some() && existing.new_content.is_some(),
+        };
+        if source == ChangeSource::Tool && tool_patch_diff.is_some() {
+            // When the frontend only captured a small patch fragment (or failed to read disk),
+            // full-context diffs become "everything changed". Prefer tool diff hints in that case.
+            if prefer_tool_patch {
+                has_full_context = false;
+            } else if looks_like_fragment_pair(&existing.old_content, &existing.new_content) {
+                has_full_context = false;
+            }
+        }
+        if has_full_context {
+            let (diff, added, removed) =
+                recompute_change_diff_fields(&existing.file_path, &existing.old_content, &existing.new_content);
+            existing.unified_diff = diff;
+            existing.lines_added = added;
+            existing.lines_removed = removed;
+        } else if let Some(hint) = tool_patch_diff.clone() {
+            let (added, removed) = count_diff_lines(&hint);
+            existing.old_content = None;
+            existing.new_content = None;
+            existing.unified_diff = match existing.unified_diff.take() {
+                Some(mut prev) => {
+                    if !prev.ends_with('\n') { prev.push('\n'); }
+                    prev.push_str(&hint);
+                    Some(prev)
+                }
+                None => Some(hint),
+            };
+            existing.lines_added = Some(existing.lines_added.unwrap_or(0) + added);
+            existing.lines_removed = Some(existing.lines_removed.unwrap_or(0) + removed);
+        }
+
         // Prefer latest metadata if provided
         if tool_name.is_some() {
             existing.tool_name = tool_name;
-        }
-        if tool_call_id.is_some() {
-            existing.tool_call_id = tool_call_id;
         }
         if command.is_some() {
             existing.command = command;
@@ -543,26 +713,48 @@ pub fn record_file_change(
         return Ok(existing_id);
     }
 
-    // 生成 unified diff
-    let (unified_diff, lines_added, lines_removed) = match (&final_old, &final_new) {
-        (Some(old), Some(new)) => {
-            let diff = generate_unified_diff(&normalized_file_path, old, new);
-            let (added, removed) = count_diff_lines(&diff);
-            (Some(diff), Some(added), Some(removed))
+    // Build diff fields.
+    //
+    // Prefer full-context diffs when possible; otherwise fall back to tool diff hints.
+    // For updates without old snapshots, it's better to show the patch the tool applied than
+    // to mis-classify the change as a full-file create.
+    let mut has_full_context = match effective_change_type {
+        ChangeType::Create => final_new.is_some(),
+        ChangeType::Delete => final_old.is_some(),
+        ChangeType::Update => final_old.is_some() && final_new.is_some(),
+    };
+    if source == ChangeSource::Tool && tool_patch_diff.is_some() {
+        if prefer_tool_patch {
+            has_full_context = false;
+        } else if effective_change_type == ChangeType::Update && looks_like_fragment_pair(&final_old, &final_new) {
+            has_full_context = false;
         }
-        (None, Some(new)) => {
-            // 新建文件
-            let lines = new.lines().count() as i32;
-            let diff = generate_create_diff(&normalized_file_path, new);
-            (Some(diff), Some(lines), Some(0))
+    }
+
+    let (unified_diff, lines_added, lines_removed, stored_old, stored_new) = if has_full_context {
+        match (&final_old, &final_new) {
+            (Some(old), Some(new)) => {
+                let diff = generate_unified_diff(&normalized_file_path, old, new);
+                let (added, removed) = count_diff_lines(&diff);
+                (Some(diff), Some(added), Some(removed), final_old, final_new)
+            }
+            (None, Some(new)) => {
+                let lines = new.lines().count() as i32;
+                let diff = generate_create_diff(&normalized_file_path, new);
+                (Some(diff), Some(lines), Some(0), None, Some(new.clone()))
+            }
+            (Some(old), None) => {
+                let lines = old.lines().count() as i32;
+                let diff = generate_delete_diff(&normalized_file_path, old);
+                (Some(diff), Some(0), Some(lines), Some(old.clone()), None)
+            }
+            (None, None) => (None, None, None, None, None),
         }
-        (Some(old), None) => {
-            // 删除文件
-            let lines = old.lines().count() as i32;
-            let diff = generate_delete_diff(&normalized_file_path, old);
-            (Some(diff), Some(0), Some(lines))
-        }
-        (None, None) => (None, None, None),
+    } else if let Some(hint) = tool_patch_diff.clone() {
+        let (added, removed) = count_diff_lines(&hint);
+        (Some(hint), Some(added), Some(removed), None, None)
+    } else {
+        (None, None, None, None, None)
     };
 
     // 生成唯一 ID
@@ -577,8 +769,8 @@ pub fn record_file_change(
         file_path: normalized_file_path,
         change_type: effective_change_type,
         source,
-        old_content: final_old,
-        new_content: final_new,
+        old_content: stored_old,
+        new_content: stored_new,
         unified_diff,
         lines_added,
         lines_removed,
@@ -696,6 +888,13 @@ fn backfill_change_content(session_id: &str, project_path: &str, change: &mut Co
                 mutated = true;
             }
         }
+        // Fallback when git records are missing/disabled: use HEAD snapshot.
+        if option_string_is_empty(&change.old_content) {
+            if let Some(old) = git_show_file(project_path, "HEAD", &normalized_path) {
+                change.old_content = Some(old);
+                mutated = true;
+            }
+        }
     }
 
     if change.change_type != ChangeType::Delete && option_string_is_empty(&change.new_content) {
@@ -771,6 +970,14 @@ fn upgrade_change_records(session_id: &str, records: &mut CodexChangeRecords) ->
 
     records.changes = merged;
 
+    // 2.5) Repair legacy tool changes where we accidentally stored patch fragments as old_content/new_content.
+    // This happens when a single prompt edits the same file multiple times (multiple apply_patch),
+    // and the backend merges records by keeping the earliest old + latest new.
+    // If old/new are not from the same base revision, diffs become nonsensical ("everything changed").
+    if repair_tool_fragment_changes(records) {
+        mutated = true;
+    }
+
     // 3) Backfill missing content/diff for history display
     for change in records.changes.iter_mut() {
         if backfill_change_content(session_id, &records.project_path, change) {
@@ -778,8 +985,82 @@ fn upgrade_change_records(session_id: &str, records: &mut CodexChangeRecords) ->
         }
     }
 
+    // 4) Note: prompt_index re-mapping now happens at the UI layer using tool_call_id matching.
+    // Avoid reading session JSONL here to prevent blocking when WSL/UNC paths are unavailable.
+
     if mutated {
         records.updated_at = Utc::now().to_rfc3339();
+    }
+
+    mutated
+}
+
+fn looks_like_fragment_pair(old_content: &Option<String>, new_content: &Option<String>) -> bool {
+    let (Some(old), Some(new)) = (old_content.as_deref(), new_content.as_deref()) else {
+        return false;
+    };
+
+    looks_like_fragment_text(old, new)
+}
+
+fn looks_like_fragment_text(old: &str, new: &str) -> bool {
+    let old_len = old.trim().len();
+    let new_len = new.trim().len();
+    if old_len == 0 || new_len == 0 {
+        return false;
+    }
+
+    let old_lines = old.lines().count();
+    let new_lines = new.lines().count();
+
+    // Heuristic: old is a small patch fragment while new looks like a full file.
+    (old_len < 4_000 && new_len > 10_000 && old_len * 5 < new_len)
+        || (old_lines < 80 && new_lines > 300 && old_lines * 5 < new_lines)
+}
+
+fn repair_tool_fragment_changes(records: &mut CodexChangeRecords) -> bool {
+    let mut mutated = false;
+
+    // Process changes in prompt order so we can use "previous new_content" as the base for the next prompt.
+    let mut indices: Vec<usize> = (0..records.changes.len()).collect();
+    indices.sort_by(|&a, &b| {
+        let ca = &records.changes[a];
+        let cb = &records.changes[b];
+        ca.prompt_index
+            .cmp(&cb.prompt_index)
+            .then_with(|| ca.timestamp.cmp(&cb.timestamp))
+    });
+
+    let mut last_by_file: HashMap<String, String> = HashMap::new();
+
+    for idx in indices {
+        let change = &mut records.changes[idx];
+        let key = change.file_path.clone();
+
+        if change.source == ChangeSource::Tool && change.change_type == ChangeType::Update {
+            if looks_like_fragment_pair(&change.old_content, &change.new_content) {
+                if let Some(prev) = last_by_file.get(&key).cloned() {
+                    change.old_content = Some(prev);
+                    mutated = true;
+                } else if let Some(head) = git_show_file(&records.project_path, "HEAD", &key) {
+                    change.old_content = Some(head);
+                    mutated = true;
+                }
+            }
+        }
+
+        match change.change_type {
+            ChangeType::Delete => {
+                last_by_file.remove(&key);
+            }
+            _ => {
+                if let Some(new) = change.new_content.as_ref() {
+                    if !new.trim().is_empty() {
+                        last_by_file.insert(key, new.clone());
+                    }
+                }
+            }
+        }
     }
 
     mutated
@@ -853,12 +1134,20 @@ pub fn detect_changes_after_command(
 
     for file in &changed_files {
         let full_path = Path::new(project_path).join(file);
-        let old_content = session_snapshots.and_then(|s| s.get(file).cloned());
+        let mut old_content = session_snapshots.and_then(|s| s.get(file).cloned());
         let new_content = if full_path.exists() {
             fs::read_to_string(&full_path).ok()
         } else {
             None
         };
+
+        // If we didn't snapshot this file before the command (common when the repo was clean),
+        // try to read the tracked version from git so we don't mark it as "create".
+        if old_content.is_none() && new_content.is_some() {
+            if let Some(head) = git_show_file(project_path, "HEAD", file) {
+                old_content = Some(head);
+            }
+        }
 
         // 确定变更类型
         let change_type = match (&old_content, &new_content) {
@@ -877,6 +1166,7 @@ pub fn detect_changes_after_command(
             ChangeSource::Command,
             old_content,
             new_content,
+            None,
             None,
             None,
             Some(command.to_string()),
@@ -924,6 +1214,124 @@ fn get_git_changed_files(project_path: &str) -> Result<Vec<String>, String> {
 
 /// 生成 unified diff 格式
 fn generate_unified_diff(file_path: &str, old_content: &str, new_content: &str) -> String {
+    if let Some(diff) = generate_unified_diff_via_git(file_path, old_content, new_content) {
+        return diff;
+    }
+    generate_unified_diff_naive(file_path, old_content, new_content)
+}
+
+fn generate_unified_diff_via_git(
+    file_path: &str,
+    old_content: &str,
+    new_content: &str,
+) -> Option<String> {
+    let dir = tempfile::tempdir().ok()?;
+
+    let safe_rel = sanitize_relative_path_for_temp(file_path);
+    let old_rel = PathBuf::from("old").join(&safe_rel);
+    let new_rel = PathBuf::from("new").join(&safe_rel);
+    let old_abs = dir.path().join(&old_rel);
+    let new_abs = dir.path().join(&new_rel);
+
+    if let Some(parent) = old_abs.parent() {
+        fs::create_dir_all(parent).ok()?;
+    }
+    if let Some(parent) = new_abs.parent() {
+        fs::create_dir_all(parent).ok()?;
+    }
+
+    fs::write(&old_abs, old_content).ok()?;
+    fs::write(&new_abs, new_content).ok()?;
+
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "diff",
+        "--no-index",
+        "--text",
+        "--no-color",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--",
+    ]);
+    cmd.arg(&old_rel);
+    cmd.arg(&new_rel);
+    cmd.current_dir(dir.path());
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    let output = cmd.output().ok()?;
+
+    // git diff exits with:
+    // - 0 when no diff
+    // - 1 when diff exists
+    // - >1 on error
+    let code = output.status.code().unwrap_or(0);
+    if code != 0 && code != 1 {
+        return None;
+    }
+
+    let raw = String::from_utf8(output.stdout).ok()?;
+    if raw.trim().is_empty() {
+        return Some(format!("--- a/{}\n+++ b/{}\n", file_path, file_path));
+    }
+
+    let mut rewritten = String::with_capacity(raw.len());
+    for line in raw.lines() {
+        if line.starts_with("diff --git ") {
+            rewritten.push_str(&format!("diff --git a/{} b/{}", file_path, file_path));
+        } else if line.starts_with("--- ") {
+            if line.contains("/dev/null") {
+                rewritten.push_str(line);
+            } else {
+                rewritten.push_str(&format!("--- a/{}", file_path));
+            }
+        } else if line.starts_with("+++ ") {
+            if line.contains("/dev/null") {
+                rewritten.push_str(line);
+            } else {
+                rewritten.push_str(&format!("+++ b/{}", file_path));
+            }
+        } else {
+            rewritten.push_str(line);
+        }
+        rewritten.push('\n');
+    }
+
+    Some(rewritten)
+}
+
+fn sanitize_relative_path_for_temp(file_path: &str) -> PathBuf {
+    let normalized = file_path.replace('\\', "/");
+    let mut out = PathBuf::new();
+
+    for raw_part in normalized.split('/') {
+        let part = raw_part.trim();
+        if part.is_empty() || part == "." || part == ".." {
+            continue;
+        }
+
+        // Keep the temp dir portable (Windows filename restrictions).
+        let cleaned: String = part
+            .chars()
+            .map(|c| match c {
+                '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+                _ => c,
+            })
+            .collect();
+
+        out.push(cleaned);
+    }
+
+    if out.as_os_str().is_empty() {
+        out.push("file");
+    }
+
+    out
+}
+
+/// Fallback diff (very naive line-by-line compare). Kept for environments without git.
+fn generate_unified_diff_naive(file_path: &str, old_content: &str, new_content: &str) -> String {
     use std::fmt::Write;
 
     let old_lines: Vec<&str> = old_content.lines().collect();
@@ -1021,9 +1429,12 @@ fn count_diff_lines(diff: &str) -> (i32, i32) {
     let mut removed = 0;
 
     for line in diff.lines() {
-        if line.starts_with('+') && !line.starts_with("+++") {
+        // Only ignore the unified diff file headers ("+++ b/file", "--- a/file").
+        // Do NOT blanket-ignore lines starting with "+++" / "---" because real file
+        // content can start with those characters inside hunks.
+        if line.starts_with('+') && !line.starts_with("+++ ") {
             added += 1;
-        } else if line.starts_with('-') && !line.starts_with("---") {
+        } else if line.starts_with('-') && !line.starts_with("--- ") {
             removed += 1;
         }
     }
@@ -1085,6 +1496,9 @@ pub async fn codex_record_file_change(
     prompt_text: String,
     new_content: String,
     old_content: Option<String>,
+    tool_name: Option<String>,
+    tool_call_id: Option<String>,
+    diff_hint: Option<String>,
     app_handle: AppHandle,
 ) -> Result<String, String> {
     // Keep for future UI display (avoid unused warnings)
@@ -1123,8 +1537,9 @@ pub async fn codex_record_file_change(
         source_enum,
         old_content,
         new_content_opt,
-        None, // tool_name
-        None, // tool_call_id
+        tool_name,
+        tool_call_id,
+        diff_hint,
         None, // command
     )?;
 
@@ -1163,11 +1578,20 @@ pub async fn codex_record_file_change(
 /// 获取会话的所有文件变更
 #[tauri::command]
 pub async fn codex_list_file_changes(session_id: String) -> Result<Vec<CodexFileChange>, String> {
+    fn to_summary(change: &CodexFileChange) -> CodexFileChange {
+        // Keep list payload small (history panel loads fast). Detail API fetches full content on demand.
+        let mut c = change.clone();
+        c.old_content = None;
+        c.new_content = None;
+        c.unified_diff = None;
+        c
+    }
+
     let trackers = CHANGE_TRACKERS.lock().unwrap();
 
     // 先尝试从内存获取
     if let Some(records) = trackers.get(&session_id) {
-        return Ok(records.changes.clone());
+        return Ok(records.changes.iter().map(to_summary).collect());
     }
 
     drop(trackers);
@@ -1180,19 +1604,13 @@ pub async fn codex_list_file_changes(session_id: String) -> Result<Vec<CodexFile
         let mut records: CodexChangeRecords = serde_json::from_str(&content)
             .map_err(|e| format!("解析 JSON 失败: {}", e))?;
 
-        // Upgrade (normalize paths / merge duplicates / backfill missing diff context)
+        // Upgrade legacy records (normalize paths / merge duplicates / backfill diff context)
         let upgraded = upgrade_change_records(&session_id, &mut records);
-
-        // 缓存到内存
-        let mut trackers = CHANGE_TRACKERS.lock().unwrap();
-        trackers.insert(session_id.clone(), records.clone());
-
-        // Persist upgrades so history stays stable
         if upgraded {
             if let Ok(pretty) = serde_json::to_string_pretty(&records) {
                 if let Err(e) = fs::write(&path, pretty) {
                     log::warn!(
-                        "[ChangeTracker] Failed to persist upgraded change records ({}): {}",
+                        "[ChangeTracker] Failed to persist upgraded records on list ({}): {}",
                         session_id,
                         e
                     );
@@ -1200,7 +1618,12 @@ pub async fn codex_list_file_changes(session_id: String) -> Result<Vec<CodexFile
             }
         }
 
-        return Ok(records.changes);
+        let summaries: Vec<CodexFileChange> = records.changes.iter().map(to_summary).collect();
+
+        // 缓存到内存（保存完整记录，详情页可直接使用）
+        let mut trackers = CHANGE_TRACKERS.lock().unwrap();
+        trackers.insert(session_id.clone(), records);
+        return Ok(summaries);
     }
 
     // 没有记录
@@ -1213,12 +1636,47 @@ pub async fn codex_get_change_detail(
     session_id: String,
     change_id: String,
 ) -> Result<CodexFileChange, String> {
-    let changes = codex_list_file_changes(session_id).await?;
+    // Prefer in-memory full records if available.
+    {
+        let trackers = CHANGE_TRACKERS.lock().unwrap();
+        if let Some(records) = trackers.get(&session_id) {
+            if let Some(found) = records.changes.iter().find(|c| c.id == change_id) {
+                return Ok(found.clone());
+            }
+        }
+    }
 
-    changes
-        .into_iter()
-        .find(|c| c.id == change_id)
-        .ok_or_else(|| format!("变更 {} 未找到", change_id))
+    // Fallback to file (full payload).
+    let path = get_change_records_path(&session_id)?;
+    if path.exists() {
+        let content = fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {}", e))?;
+        let mut records: CodexChangeRecords =
+            serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {}", e))?;
+
+        // Upgrade legacy records (normalize paths / merge duplicates / backfill diff context)
+        let upgraded = upgrade_change_records(&session_id, &mut records);
+        if upgraded {
+            if let Ok(pretty) = serde_json::to_string_pretty(&records) {
+                if let Err(e) = fs::write(&path, pretty) {
+                    log::warn!(
+                        "[ChangeTracker] Failed to persist upgraded records on get_detail ({}): {}",
+                        session_id,
+                        e
+                    );
+                }
+            }
+        }
+
+        if let Some(found) = records.changes.iter().find(|c| c.id == change_id) {
+            let out = found.clone();
+            // Cache full records so subsequent detail/list reads are consistent.
+            let mut trackers = CHANGE_TRACKERS.lock().unwrap();
+            trackers.insert(session_id.clone(), records);
+            return Ok(out);
+        }
+    }
+
+    Err(format!("变更 {} 未找到", change_id))
 }
 
 /// 导出整个会话的变更为 patch 文件

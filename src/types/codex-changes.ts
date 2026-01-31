@@ -77,6 +77,8 @@ export interface GroupedChanges {
   promptIndex: number;
   /** prompt 时间戳（使用第一个变更的时间戳） */
   timestamp: string;
+  /** prompt 结束时间戳（使用最后一个变更的时间戳，用于排序） */
+  endTimestamp: string;
   /** 该 prompt 产生的所有变更 */
   changes: CodexFileChange[];
   /** 统计信息 */
@@ -112,25 +114,56 @@ export function groupChangesByPrompt(changes: CodexFileChange[]): GroupedChanges
     // 按时间排序
     promptChanges.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 
+    const startTimestamp = promptChanges[0]?.timestamp || '';
+    const endTimestamp = promptChanges[promptChanges.length - 1]?.timestamp || startTimestamp;
+
+    // Stats are based on "latest per file" to avoid double-counting when
+    // the same file is recorded multiple times within one prompt.
+    const latestByFile = new Map<string, CodexFileChange>();
+    for (const change of promptChanges) {
+      const key = (change.file_path || '').replace(/\\/g, '/');
+      latestByFile.set(key, change);
+    }
+    const uniqueChanges = Array.from(latestByFile.values()).sort((a, b) =>
+      a.file_path.localeCompare(b.file_path)
+    );
+
     const stats = {
-      totalFiles: promptChanges.length,
-      created: promptChanges.filter(c => c.change_type === 'create').length,
-      updated: promptChanges.filter(c => c.change_type === 'update').length,
-      deleted: promptChanges.filter(c => c.change_type === 'delete').length,
-      linesAdded: promptChanges.reduce((sum, c) => sum + (c.lines_added || 0), 0),
-      linesRemoved: promptChanges.reduce((sum, c) => sum + (c.lines_removed || 0), 0),
+      totalFiles: uniqueChanges.length,
+      created: uniqueChanges.filter(c => c.change_type === 'create').length,
+      updated: uniqueChanges.filter(c => c.change_type === 'update').length,
+      deleted: uniqueChanges.filter(c => c.change_type === 'delete').length,
+      linesAdded: uniqueChanges.reduce((sum, c) => sum + (c.lines_added || 0), 0),
+      linesRemoved: uniqueChanges.reduce((sum, c) => sum + (c.lines_removed || 0), 0),
     };
 
     result.push({
       promptIndex,
-      timestamp: promptChanges[0]?.timestamp || '',
-      changes: promptChanges,
+      // Display start time (closer to "prompt sent"). Ordering uses endTimestamp below.
+      timestamp: startTimestamp,
+      endTimestamp,
+      // Only show the latest change per file to match "files changed" semantics.
+      changes: uniqueChanges,
       stats,
     });
   }
 
-  // 按 prompt 索引排序（降序，最新的在前）
-  result.sort((a, b) => b.promptIndex - a.promptIndex);
+  // Sort by timestamp (desc) for a more "latest-first" UX.
+  // Prompt indices can become non-monotonic when sessions are replayed / truncated.
+  result.sort((a, b) => {
+    if (a.endTimestamp && b.endTimestamp) {
+      const byTime = b.endTimestamp.localeCompare(a.endTimestamp);
+      if (byTime !== 0) return byTime;
+    }
+
+    // Fall back to displayed timestamp, then prompt index.
+    if (a.timestamp && b.timestamp) {
+      const byStart = b.timestamp.localeCompare(a.timestamp);
+      if (byStart !== 0) return byStart;
+    }
+
+    return b.promptIndex - a.promptIndex;
+  });
 
   return result;
 }

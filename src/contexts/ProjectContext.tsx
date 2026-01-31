@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback, useEffect, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect, ReactNode, useRef } from 'react';
 import { api, Project, Session, UnifiedProject, EngineFilter } from '@/lib/api';
 import { mergeProjects, filterProjectsByEngine } from '@/lib/projectMerger';
 import { useTranslation } from 'react-i18next';
@@ -42,13 +42,22 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const sessionsCacheRef = useRef<Map<string, Session[]>>(new Map());
+  const sessionsRequestRef = useRef(0);
+
+  const normalizeProjectPath = useCallback((path: string) => {
+    return path.trim().replace(/\\/g, '/').toLowerCase();
+  }, []);
 
   // Compute filtered projects based on engine filter
   const filteredProjects = filterProjectsByEngine(unifiedProjects, engineFilter);
 
   const loadProjects = useCallback(async () => {
     try {
-      setLoading(true);
+      const hasCachedProjects = unifiedProjects.length > 0 || projects.length > 0;
+      if (!hasCachedProjects) {
+        setLoading(true);
+      }
       setError(null);
 
       // Load Claude and Codex projects in parallel
@@ -76,15 +85,20 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [t, unifiedProjects.length, projects.length]);
 
   const selectProject = useCallback(async (project: Project) => {
     console.log('[ProjectContext] selectProject called with:', project.id, project.path);
     try {
+      const requestId = ++sessionsRequestRef.current;
+      const cacheKey = normalizeProjectPath(project.path);
+      const cachedSessions = sessionsCacheRef.current.get(cacheKey);
+
       setLoading(true);
       setError(null);
       setSelectedProject(project);
       setSelectedUnifiedProject(null);
+      setSessions(cachedSessions ?? []);
       console.log('[ProjectContext] selectedProject set, loading sessions in parallel...');
 
       // Load Claude/Codex and Gemini sessions in parallel
@@ -96,6 +110,7 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
         })
       ]);
 
+      if (requestId !== sessionsRequestRef.current) return;
       console.log('[ProjectContext] Claude/Codex sessions loaded:', claudeCodexSessions.length);
 
       // Convert GeminiSessionInfo to Session format
@@ -113,6 +128,7 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
       const allSessions = [...claudeCodexSessions, ...geminiSessions];
       console.log('[ProjectContext] Loaded sessions:', allSessions.length);
       setSessions(allSessions);
+      sessionsCacheRef.current.set(cacheKey, allSessions);
 
       // Background indexing
       api.preindexProject(project.path).catch(console.error);
@@ -127,6 +143,10 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
   const selectUnifiedProject = useCallback(async (project: UnifiedProject) => {
     console.log('[ProjectContext] selectUnifiedProject called with:', project.path);
     try {
+      const requestId = ++sessionsRequestRef.current;
+      const cacheKey = normalizeProjectPath(project.path);
+      const cachedSessions = sessionsCacheRef.current.get(cacheKey);
+
       setLoading(true);
       setError(null);
       setSelectedUnifiedProject(project);
@@ -137,6 +157,7 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
       );
       setSelectedProject(claudeProject || null);
 
+      setSessions(cachedSessions ?? []);
       console.log('[ProjectContext] Loading sessions for unified project...');
 
       // Load sessions from all engines in parallel
@@ -186,6 +207,7 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
       );
 
       const results = await Promise.all(sessionPromises);
+      if (requestId !== sessionsRequestRef.current) return;
       const allSessions = results.flat();
 
       // Sort by created_at descending
@@ -193,6 +215,7 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
 
       console.log('[ProjectContext] Loaded sessions:', allSessions.length);
       setSessions(allSessions);
+      sessionsCacheRef.current.set(cacheKey, allSessions);
 
       // Background indexing
       api.preindexProject(project.path).catch(console.error);
@@ -210,6 +233,7 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
 
     try {
       const projectPath = 'path' in project ? project.path : (project as Project).path;
+      const cacheKey = normalizeProjectPath(projectPath);
       const projectId = selectedProject?.id || '';
 
       const [claudeCodexSessions, geminiResult] = await Promise.all([
@@ -244,16 +268,18 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
       const allSessions = [...claudeCodexSessions, ...geminiSessions];
       allSessions.sort((a, b) => b.created_at - a.created_at);
       setSessions(allSessions);
+      sessionsCacheRef.current.set(cacheKey, allSessions);
     } catch (err) {
       console.error("Failed to refresh sessions:", err);
     }
-  }, [selectedProject, selectedUnifiedProject]);
+  }, [selectedProject, selectedUnifiedProject, normalizeProjectPath]);
 
   const deleteProject = useCallback(async (project: Project) => {
     try {
       setLoading(true);
       await api.deleteProject(project.id);
       await loadProjects();
+      sessionsCacheRef.current.delete(normalizeProjectPath(project.path));
       if (selectedProject?.id === project.id) {
         setSelectedProject(null);
         setSelectedUnifiedProject(null);
@@ -265,7 +291,7 @@ export const ProjectProvider: React.FC<{ children: ReactNode }> = ({ children })
     } finally {
       setLoading(false);
     }
-  }, [loadProjects, selectedProject]);
+  }, [loadProjects, selectedProject, normalizeProjectPath]);
 
   const clearSelection = useCallback(() => {
     setSelectedProject(null);

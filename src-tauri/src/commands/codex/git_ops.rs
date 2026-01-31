@@ -507,6 +507,25 @@ pub async fn record_codex_prompt_sent(
 ) -> Result<usize, String> {
     log::info!("[Codex Record] Recording prompt sent for session: {}", session_id);
 
+    // Derive prompt_index from the current session JSONL prompt count, so indices stay aligned with
+    // `extract_codex_prompts()` (and thus UI prompt numbering), even when:
+    // - Git operations are disabled
+    // - prompts are sent from other clients (e.g. VSCode plugin) into the same session
+    //
+    // NOTE: This is called *before* the new prompt is appended to the session file, so the next
+    // prompt index is equal to the current prompt count.
+    let prompt_index_from_session = match extract_codex_prompts(&session_id) {
+        Ok(prompts) => Some(prompts.len()),
+        Err(e) => {
+            log::warn!(
+                "[Codex Record] Failed to extract prompts for index derivation ({}): {}",
+                session_id,
+                e
+            );
+            None
+        }
+    };
+
     // On Windows, project_path may come from Codex/WSL (e.g. /mnt/d/...) even though
     // Git runs on the host. Normalize so git commands can actually find the directory.
     #[cfg(target_os = "windows")]
@@ -535,10 +554,23 @@ pub async fn record_codex_prompt_sent(
 
     if execution_config.disable_rewind_git_operations {
         log::info!("[Codex Record] Git operations disabled, skipping git record");
-        // Still need to return a prompt_index for tracking purposes
+        // Still need to return a prompt_index for tracking purposes.
+        // Prefer session-derived index so prompt numbers match conversation ordering.
+        if let Some(prompt_index) = prompt_index_from_session {
+            log::info!(
+                "[Codex Record] Returning prompt index #{} (no git record, session-derived)",
+                prompt_index
+            );
+            return Ok(prompt_index);
+        }
+
+        // Fallback to legacy behavior when session file is unavailable.
         let git_records = load_codex_git_records(&session_id)?;
         let prompt_index = git_records.records.len();
-        log::info!("[Codex Record] Returning prompt index #{} (no git record)", prompt_index);
+        log::info!(
+            "[Codex Record] Returning prompt index #{} (no git record, legacy fallback)",
+            prompt_index
+        );
         return Ok(prompt_index);
     }
 
@@ -558,8 +590,8 @@ pub async fn record_codex_prompt_sent(
         git_records.project_path = project_path.clone();
     }
 
-    // Calculate prompt index
-    let prompt_index = git_records.records.len();
+    // Calculate prompt index (prefer session-derived; fallback to legacy counter)
+    let prompt_index = prompt_index_from_session.unwrap_or_else(|| git_records.records.len());
 
     // Create new record
     let record = CodexPromptGitRecord {
@@ -569,7 +601,18 @@ pub async fn record_codex_prompt_sent(
         timestamp: Utc::now().to_rfc3339(),
     };
 
-    git_records.records.push(record);
+    // Avoid duplicates if the command is triggered twice for the same prompt index.
+    if let Some(existing) = git_records
+        .records
+        .iter_mut()
+        .find(|r| r.prompt_index == prompt_index)
+    {
+        existing.commit_before = record.commit_before;
+        existing.commit_after = None;
+        existing.timestamp = record.timestamp;
+    } else {
+        git_records.records.push(record);
+    }
     save_codex_git_records(&session_id, &git_records)?;
 
     log::info!("[Codex Record] Recorded prompt #{} with commit_before: {}",
@@ -737,6 +780,18 @@ pub async fn revert_codex_to_prompt(
                 truncate_codex_git_records(&session_id, prompt_index)?;
             }
 
+            // Truncate change records so history/files-changed don't include stale prompts.
+            if let Err(e) = super::change_tracker::truncate_change_records_after_prompt(
+                &session_id,
+                prompt_index as i32,
+            ) {
+                log::warn!(
+                    "[Codex Rewind] Failed to truncate change records (session {}): {}",
+                    session_id,
+                    e
+                );
+            }
+
             log::info!("[Codex Rewind] Successfully reverted conversation to prompt #{}", prompt_index);
         }
 
@@ -777,6 +832,18 @@ pub async fn revert_codex_to_prompt(
             // Truncate git records
             if !git_operations_disabled {
                 truncate_codex_git_records(&session_id, prompt_index)?;
+            }
+
+            // Truncate change records so history/files-changed don't include stale prompts.
+            if let Err(e) = super::change_tracker::truncate_change_records_after_prompt(
+                &session_id,
+                prompt_index as i32,
+            ) {
+                log::warn!(
+                    "[Codex Rewind] Failed to truncate change records (session {}): {}",
+                    session_id,
+                    e
+                );
             }
 
             log::info!("[Codex Rewind] Successfully reverted both to prompt #{}", prompt_index);

@@ -66,7 +66,9 @@ function isInjectedContextMessage(message: ClaudeStreamMessage): boolean {
   return (
     lower.includes('<environment_context>') ||
     lower.includes('# agents.md instructions') ||
-    lower.includes('<permissions instructions>')
+    lower.includes('<permissions instructions>') ||
+    // Internal "turn aborted" markers should never be rendered as chat content.
+    lower.includes('<turn_aborted')
   );
 }
 
@@ -175,6 +177,20 @@ export function useDisplayableMessages(
   const hideStartupWarnings = options.hideStartupWarnings !== false;
 
   return useMemo(() => {
+    // Codex may emit assistant output as event_msg.agent_message (fallback) AND as response_item.message.
+    // We prefer response_item when available and drop the agent_message duplicate.
+    const codexAssistantResponseKeys = new Set<string>();
+    for (const msg of messages) {
+      if (msg.engine !== 'codex') continue;
+      if (msg.type !== 'assistant') continue;
+      if ((msg as any)._codexAgentMessage) continue;
+
+      const text = extractMessageText(msg).trim();
+      if (!text) continue;
+      const ts = (msg.timestamp || msg.receivedAt || '').toString();
+      codexAssistantResponseKeys.add(`${ts}|${text}`);
+    }
+
     // 如果需要隐藏 Warmup，先找到所有 Warmup 消息的索引
     const warmupIndices = new Set<number>();
 
@@ -196,6 +212,18 @@ export function useDisplayableMessages(
     }
 
     const filtered = messages.filter((message, index) => {
+      // De-dupe Codex agent_message fallback when response_item exists for the same (timestamp, text).
+      if (message.engine === 'codex' && message.type === 'assistant' && (message as any)._codexAgentMessage) {
+        const text = extractMessageText(message).trim();
+        if (text) {
+          const ts = (message.timestamp || message.receivedAt || '').toString();
+          const key = `${ts}|${text}`;
+          if (codexAssistantResponseKeys.has(key)) {
+            return false;
+          }
+        }
+      }
+
       // 规则 0：隐藏 Warmup 消息及其回复
       if (hideWarmupMessages && warmupIndices.has(index)) {
         return false;

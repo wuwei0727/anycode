@@ -5,7 +5,7 @@
  * 支持按 prompt 分组、筛选、导出
  */
 
-import React, { useState, useMemo, useCallback, useEffect } from 'react';
+import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   X,
@@ -81,29 +81,66 @@ export const CodexChangeHistory: React.FC<CodexChangeHistoryProps> = ({
   const [exporting, setExporting] = useState(false);
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
 
+  const didSetInitialExpandedRef = useRef(false);
+  const loadStateRef = useRef({ inFlight: false, queued: false, seq: 0 });
+
+  useEffect(() => {
+    didSetInitialExpandedRef.current = false;
+    setExpandedPrompts(new Set());
+  }, [sessionId]);
+
   // 加载变更历史
-  const loadChanges = useCallback(async () => {
+  const loadChanges = useCallback(async (options?: { silent?: boolean }) => {
     if (!sessionId) return;
 
-    setLoading(true);
+    const silent = options?.silent === true;
+
+    if (loadStateRef.current.inFlight) {
+      loadStateRef.current.queued = true;
+      return;
+    }
+
+    loadStateRef.current.inFlight = true;
+    loadStateRef.current.queued = false;
+    const requestId = ++loadStateRef.current.seq;
+
+    if (!silent) setLoading(true);
     setError(null);
 
     try {
       const data = await api.codexListFileChanges(sessionId);
+
+      if (requestId !== loadStateRef.current.seq) return;
+
       setChanges(data);
 
-      // 默认展开第一个 prompt
-      if (data.length > 0) {
-        const firstPromptIndex = data[0]?.prompt_index;
-        if (firstPromptIndex !== undefined) {
-          setExpandedPrompts(new Set([firstPromptIndex]));
+      // 默认展开最新的 prompt（只在首次加载/新会话时做一次，避免自动刷新打断用户展开状态）
+      if (!didSetInitialExpandedRef.current && data.length > 0) {
+        const latest = data
+          .slice()
+          .sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+          .at(-1);
+        const latestPromptIndex = latest?.prompt_index;
+        if (latestPromptIndex !== undefined) {
+          setExpandedPrompts((prev) => (prev.size > 0 ? prev : new Set([latestPromptIndex])));
         }
+        didSetInitialExpandedRef.current = true;
       }
     } catch (err) {
       console.error('Failed to load changes:', err);
-      setError(err instanceof Error ? err.message : '加载变更历史失败');
+      if (requestId === loadStateRef.current.seq) {
+        setError(err instanceof Error ? err.message : '加载变更历史失败');
+      }
     } finally {
-      setLoading(false);
+      if (requestId === loadStateRef.current.seq) {
+        setLoading(false);
+      }
+      loadStateRef.current.inFlight = false;
+
+      if (loadStateRef.current.queued) {
+        loadStateRef.current.queued = false;
+        void loadChanges({ silent: true });
+      }
     }
   }, [sessionId]);
 
@@ -134,8 +171,8 @@ export const CodexChangeHistory: React.FC<CodexChangeHistoryProps> = ({
           // Debounce: multiple file changes may arrive back-to-back
           if (refreshTimer) clearTimeout(refreshTimer);
           refreshTimer = setTimeout(() => {
-            loadChanges();
-          }, 150);
+            loadChanges({ silent: true });
+          }, 300);
         });
       } catch (err) {
         console.warn('[CodexChangeHistory] Failed to listen codex-change-recorded:', err);
@@ -277,7 +314,7 @@ export const CodexChangeHistory: React.FC<CodexChangeHistoryProps> = ({
               variant="ghost"
               size="sm"
               className="h-7 w-7 p-0"
-              onClick={loadChanges}
+              onClick={() => loadChanges()}
               disabled={loading}
             >
               <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
@@ -326,7 +363,7 @@ export const CodexChangeHistory: React.FC<CodexChangeHistoryProps> = ({
                 variant="outline"
                 size="sm"
                 className="mt-2"
-                onClick={loadChanges}
+                onClick={() => loadChanges()}
               >
                 重试
               </Button>
@@ -359,7 +396,7 @@ export const CodexChangeHistory: React.FC<CodexChangeHistoryProps> = ({
                     </span>
 
                     <span className="text-xs text-muted-foreground">
-                      {formatTimestamp(group.timestamp)}
+                      {formatTimestamp(group.endTimestamp || group.timestamp)}
                     </span>
 
                     <div className="flex-1" />

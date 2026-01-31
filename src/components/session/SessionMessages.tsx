@@ -69,6 +69,15 @@ export const SessionMessages = forwardRef<SessionMessagesRef, SessionMessagesPro
       <div className="w-full max-w-5xl lg:max-w-6xl xl:max-w-7xl 2xl:max-w-[85%] mx-auto">
         <div className="px-4 pt-8 pb-4 space-y-2">
           {messageGroups.map((messageGroup, index) => {
+            const groupKey =
+              messageGroup.type === 'normal'
+                ? `normal-${messageGroup.index}`
+                : messageGroup.type === 'subagent'
+                ? `subagent-${messageGroup.group.id}`
+                : messageGroup.type === 'activity'
+                ? `activity-${messageGroup.group.startIndex}`
+                : `group-${index}`;
+
             // promptIndex is needed not only for user bubbles, but also for activity/subagent groups
             // so features like change-history + diff viewers can map changes back to the prompt.
             const anchorIndex =
@@ -83,7 +92,7 @@ export const SessionMessages = forwardRef<SessionMessagesRef, SessionMessagesPro
             const promptIndex = anchorIndex !== undefined ? getPromptIndexForMessage(anchorIndex) : undefined;
 
             return (
-              <div key={index} data-index={index}>
+              <div key={groupKey} data-index={index}>
                 <StreamMessageV2
                   messageGroup={messageGroup}
                   onLinkDetected={handleLinkDetected}

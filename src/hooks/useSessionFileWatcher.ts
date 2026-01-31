@@ -10,6 +10,8 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { api, type Session } from '@/lib/api';
 import type { ClaudeStreamMessage } from '@/types/claude';
 import { CodexEventConverter } from '@/lib/codexConverter';
+import { extractFilePathFromPatchText, extractOldNewFromPatchText, splitPatchIntoFileChunks } from '@/lib/codexDiff';
+import type { CodexFileChange } from '@/types/codex-changes';
 
 interface SessionFileChangedEvent {
   session_id: string;
@@ -22,6 +24,7 @@ export interface ExternalQueuedPromptEvent {
   prompt: string;
   source: 'enqueue' | 'suppressed_user_message';
   message?: ClaudeStreamMessage;
+  displayedInline?: boolean;
 }
 
 interface UseSessionFileWatcherConfig {
@@ -35,6 +38,8 @@ interface UseSessionFileWatcherConfig {
   setMessages: React.Dispatch<React.SetStateAction<ClaudeStreamMessage[]>>;
   /** 是否正在流式输出（本地执行中） */
   isStreaming?: boolean;
+  /** 外部流式状态变化（用于外部插件占用时的排队） */
+  onExternalStreamStatusChange?: (isStreaming: boolean, engine: string) => void;
   /** 外部工具队列：入队（用于 VSCode 官方插件等） */
   onExternalQueuedPrompt?: (event: ExternalQueuedPromptEvent) => void;
   /** 外部工具队列：出队（默认移除队首） */
@@ -57,6 +62,7 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
     isMountedRef,
     setMessages,
     isStreaming = false,
+    onExternalStreamStatusChange,
     onExternalQueuedPrompt,
     onExternalDequeued,
     onExternalStreamComplete,
@@ -66,14 +72,24 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
   const unlistenRef = useRef<UnlistenFn | null>(null);
   const lastMessageCountRef = useRef(0);
   const externalStreamRef = useRef(false);
+  // Codex VSCode rollout format doesn't emit turn.completed; we use response_item(role=assistant)
+  // and a small debounce fallback after agent_message to end "external streaming" accurately.
+  const codexStreamEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const codexConverterRef = useRef<CodexEventConverter | null>(null);
   const codexPromptIndexRef = useRef(-1);
   const codexPromptTextRef = useRef('');
-  const codexTrackedFileToolsRef = useRef(new Map<string, {
+  type TrackedCodexFileToolEntry = {
     filePath: string;
     changeType: 'create' | 'update' | 'delete' | 'auto';
     oldContentPromise: Promise<string | null>;
     fallbackNewContent: string;
+    diffHint?: string;
+    toolName?: string;
+    toolNewContent?: string;
+  };
+
+  const codexTrackedFileToolsRef = useRef(new Map<string, {
+    entries: TrackedCodexFileToolEntry[];
     fallbackTimer?: ReturnType<typeof setTimeout> | null;
   }>());
   const codexRecordedToolUseIdsRef = useRef(new Set<string>());
@@ -143,9 +159,19 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
     } as ClaudeStreamMessage;
   };
 
+  const updateExternalStreaming = useCallback((next: boolean, engine: string) => {
+    if (externalStreamRef.current === next) return;
+    externalStreamRef.current = next;
+    onExternalStreamStatusChange?.(next, engine);
+  }, [onExternalStreamStatusChange]);
+
   // Reset per-session state
   useEffect(() => {
-    externalStreamRef.current = false;
+    updateExternalStreaming(false, (session as any)?.engine || 'claude');
+    if (codexStreamEndTimerRef.current) {
+      clearTimeout(codexStreamEndTimerRef.current);
+      codexStreamEndTimerRef.current = null;
+    }
     codexPromptIndexRef.current = -1;
     codexPromptTextRef.current = '';
     codexTrackedFileToolsRef.current.clear();
@@ -154,11 +180,12 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
 
     const engine = (session as any)?.engine || 'claude';
     if (engine === 'codex') {
-      codexConverterRef.current = new CodexEventConverter();
+      // Realtime file watcher should show Codex "agent_reasoning" updates (matches VSCode plugin).
+      codexConverterRef.current = new CodexEventConverter({ includeAgentReasoning: true });
     } else {
       codexConverterRef.current = null;
     }
-  }, [session?.id]);
+  }, [session?.id, updateExternalStreaming, session]);
 
   // Lazy-load readTextFile to avoid repeated dynamic imports
   const getReadTextFile = useCallback(async () => {
@@ -235,7 +262,7 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
 
     const finalizeToolChange = (toolUseId: string) => {
       const tracked = trackedTools.get(toolUseId);
-      if (!tracked) return;
+      if (!tracked || tracked.entries.length === 0) return;
       if (recordedToolUseIds.has(toolUseId)) return;
       recordedToolUseIds.add(toolUseId);
 
@@ -251,28 +278,33 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
 
           const promptText = codexPromptTextRef.current || '';
 
-          const oldContent = await tracked.oldContentPromise;
-          const resolvedChangeType =
-            tracked.changeType === 'auto'
-              ? (oldContent !== null ? 'update' : 'create')
-              : tracked.changeType;
+          for (const entry of tracked.entries) {
+            const oldContent = await entry.oldContentPromise;
+            const resolvedChangeType =
+              entry.changeType === 'auto'
+                ? (oldContent !== null ? 'update' : 'create')
+                : entry.changeType;
 
-          const diskNewContent =
-            resolvedChangeType === 'delete' ? null : await safeReadFile(tracked.filePath);
-          const newContent = diskNewContent ?? tracked.fallbackNewContent ?? '';
-          const oldContentToSend = resolvedChangeType === 'create' ? null : (oldContent ?? '');
+            const diskNewContent =
+              resolvedChangeType === 'delete' ? null : await safeReadFile(entry.filePath);
+            const newContent = (diskNewContent ?? entry.toolNewContent ?? entry.fallbackNewContent ?? '') || '';
+            const oldContentToSend = resolvedChangeType === 'create' ? null : (oldContent ?? '');
 
-          await api.codexRecordFileChange(
-            sessionId,
-            projectPath,
-            tracked.filePath,
-            resolvedChangeType,
-            'tool',
-            promptIndex,
-            promptText,
-            newContent,
-            oldContentToSend
-          );
+            await api.codexRecordFileChange(
+              sessionId,
+              projectPath,
+              entry.filePath,
+              resolvedChangeType,
+              'tool',
+              promptIndex,
+              promptText,
+              newContent,
+              oldContentToSend,
+              entry.toolName || null,
+              toolUseId,
+              entry.diffHint || null
+            );
+          }
         } catch (err) {
           console.warn('[SessionFileWatcher] Failed to record Codex file change:', err);
         } finally {
@@ -289,71 +321,107 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
       const toolName: string | undefined = block?.name;
       const toolInput: any = block?.input || {};
 
-      const filePath: string | undefined =
-        toolInput?.file_path ||
-        toolInput?.path ||
-        toolInput?.file ||
-        toolInput?.filename;
-
-      if (!toolUseId || !filePath) continue;
-      if (trackedTools.has(toolUseId)) continue;
-
-      // Determine change type
-      let changeType: 'create' | 'update' | 'delete' | 'auto' | null = null;
-      if (typeof toolInput?.change_type === 'string' && ['create', 'update', 'delete'].includes(toolInput.change_type)) {
-        changeType = toolInput.change_type;
-      } else if (typeof toolInput?.patch === 'string') {
-        const patch = toolInput.patch as string;
-        if (patch.includes('*** Create File:')) changeType = 'create';
-        else if (patch.includes('*** Delete File:')) changeType = 'delete';
-        else if (patch.includes('*** Update File:')) changeType = 'update';
-      } else if (toolName === 'write' || toolName === 'create_file') {
-        changeType = 'auto';
-      } else if (toolName === 'edit') {
-        changeType = 'update';
-      } else if (toolName === 'delete_file' || toolName === 'remove_file') {
-        changeType = 'delete';
-      }
-
-      if (!changeType) continue;
-
-      const normalizedFilePath = normalizeRecordedPath(filePath);
-
-      const oldContentPromise = (async () => {
-        const diskOld = await safeReadFile(normalizedFilePath);
-        if (diskOld !== null) return diskOld;
-        if (typeof toolInput?.old_string === 'string') return toolInput.old_string;
-        return null;
-      })();
-
-      const fallbackNewContent =
-        typeof toolInput?.content === 'string'
-          ? toolInput.content
-          : typeof toolInput?.new_string === 'string'
-          ? toolInput.new_string
-          : typeof toolInput?.patch === 'string'
-          ? toolInput.patch
-          : typeof toolInput?.diff === 'string'
-          ? toolInput.diff
-          : '';
-
-      trackedTools.set(toolUseId, {
-        filePath: normalizedFilePath,
-        changeType,
-        oldContentPromise,
-        fallbackNewContent,
-        fallbackTimer: null,
-      });
-
-      // Fallback: apply_patch-like payloads may not emit tool_result consistently
       const patchText =
         typeof toolInput?.patch === 'string'
           ? toolInput.patch
+          : typeof toolInput?.diff === 'string'
+          ? toolInput.diff
           : typeof toolInput?.raw_input === 'string'
           ? toolInput.raw_input
           : '';
+      if (!toolUseId) continue;
+      if (recordedToolUseIds.has(toolUseId)) continue;
+      if (trackedTools.has(toolUseId)) continue;
 
-      if (typeof patchText === 'string' && patchText.includes('*** Begin Patch')) {
+      const toolNameLower = (toolName || '').toLowerCase();
+
+      const inferChangeTypeFromPatch = (text: string): 'create' | 'update' | 'delete' | null => {
+        if (!text) return null;
+        if (text.includes('*** Add File:') || text.includes('*** Create File:')) return 'create';
+        if (text.includes('*** Delete File:')) return 'delete';
+        if (text.includes('*** Update File:')) return 'update';
+        if (text.includes('--- /dev/null') || text.includes('new file mode')) return 'create';
+        if (text.includes('+++ /dev/null') || text.includes('deleted file mode')) return 'delete';
+        if (text.includes('@@')) return 'update';
+        return null;
+      };
+
+      const chunks = patchText ? splitPatchIntoFileChunks(patchText) : [];
+      const inputFilePath: string | null =
+        toolInput?.file_path || toolInput?.path || toolInput?.file || toolInput?.filename || null;
+
+      const fileTargets: Array<{ filePath: string; patchText: string }> =
+        chunks.length > 0
+          ? chunks
+          : inputFilePath
+          ? [{ filePath: String(inputFilePath), patchText }]
+          : patchText
+          ? (() => {
+              const fp = extractFilePathFromPatchText(patchText);
+              return fp ? [{ filePath: fp, patchText }] : [];
+            })()
+          : [];
+
+      if (fileTargets.length === 0) continue;
+
+      const entries = fileTargets
+        .map((target): TrackedCodexFileToolEntry | null => {
+          const rawPath = String(target.filePath || '').trim();
+          if (!rawPath) return null;
+
+          const normalizedFilePath = normalizeRecordedPath(rawPath);
+          const chunkPatchText = String(target.patchText || '');
+          const patchDiff = chunkPatchText ? extractOldNewFromPatchText(chunkPatchText) : null;
+
+          let changeType: 'create' | 'update' | 'delete' | 'auto' | null = null;
+          if (typeof toolInput?.change_type === 'string' && ['create', 'update', 'delete'].includes(toolInput.change_type) && fileTargets.length === 1) {
+            changeType = toolInput.change_type;
+          } else if (chunkPatchText) {
+            changeType = inferChangeTypeFromPatch(chunkPatchText);
+          }
+
+          if (!changeType) {
+            if (toolNameLower === 'write') changeType = 'auto';
+            else if (toolNameLower === 'edit' || toolNameLower === 'multiedit') changeType = 'update';
+          }
+
+          if (!changeType) return null;
+
+          const oldContentPromise = (async () => {
+            const diskOld = await safeReadFile(normalizedFilePath);
+            if (diskOld !== null) return diskOld;
+            if (patchDiff?.oldText) return patchDiff.oldText;
+            if (typeof toolInput?.old_string === 'string') return toolInput.old_string;
+            return null;
+          })();
+
+          const toolNewContent =
+            typeof toolInput?.content === 'string'
+              ? toolInput.content
+              : typeof toolInput?.new_string === 'string'
+              ? toolInput.new_string
+              : patchDiff?.newText || undefined;
+
+          const fallbackNewContent = patchDiff?.newText || '';
+
+          return {
+            filePath: normalizedFilePath,
+            changeType,
+            oldContentPromise,
+            fallbackNewContent,
+            diffHint: chunkPatchText && chunkPatchText.trim().length > 0 ? chunkPatchText : undefined,
+            toolName: toolNameLower,
+            toolNewContent,
+          };
+        })
+        .filter((v): v is TrackedCodexFileToolEntry => Boolean(v));
+
+      if (entries.length === 0) continue;
+
+      trackedTools.set(toolUseId, { entries, fallbackTimer: null });
+
+      // Fallback: apply_patch-like payloads may not emit tool_result consistently
+      if (typeof patchText === 'string' && (patchText.includes('*** Begin Patch') || patchText.includes('diff --git'))) {
         const existing = trackedTools.get(toolUseId);
         if (existing && !existing.fallbackTimer) {
           existing.fallbackTimer = setTimeout(() => {
@@ -380,16 +448,32 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
     codexHasSyncedChangesRef.current = true;
 
     try {
-      // If no records exist, backfill from session JSONL so ChangeHistory has data.
-      const existing = await api.codexListFileChanges(session.id).catch(() => []);
-      const shouldBackfill = existing.length === 0;
+      const existing: CodexFileChange[] = await api.codexListFileChanges(session.id).catch(() => []);
+      // Seed recorded tool_use ids from persisted change records to make backfill incremental.
+      // tool_call_id may contain a comma-separated list for aggregated tool diffs.
+      const recordedToolUseIds = codexRecordedToolUseIdsRef.current;
+      for (const ch of existing) {
+        const raw = ch.tool_call_id;
+        if (typeof raw !== 'string' || !raw.trim()) continue;
+        raw
+          .split(',')
+          .map((s: string) => s.trim())
+          .filter((s: string) => s.length > 0)
+          .forEach((id: string) => recordedToolUseIds.add(id));
+      }
 
       const events = await api.loadCodexSessionHistory(session.id);
       const converter = new CodexEventConverter();
 
       let promptIndex = -1;
       for (const event of events) {
-        const rawMsg = converter.convertEventObject(event);
+        let rawMsg: ClaudeStreamMessage | null = null;
+        try {
+          rawMsg = converter.convertEventObject(event);
+        } catch (err) {
+          console.warn('[SessionFileWatcher] Failed to convert Codex history event:', err, event);
+          continue;
+        }
         if (!rawMsg) continue;
         const msg = sanitizeMessageForDisplay(rawMsg);
 
@@ -400,9 +484,7 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
           continue;
         }
 
-        if (shouldBackfill) {
-          processCodexMessageForChangeTracking(msg);
-        }
+        processCodexMessageForChangeTracking(msg);
       }
     } catch (err) {
       console.warn('[SessionFileWatcher] Failed to sync Codex changes from history:', err);
@@ -426,15 +508,48 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
     const newMessages: ClaudeStreamMessage[] = [];
 
     if (event.engine === 'codex') {
-      const converter = codexConverterRef.current || (codexConverterRef.current = new CodexEventConverter());
+      const converter =
+        codexConverterRef.current ||
+        (codexConverterRef.current = new CodexEventConverter({ includeAgentReasoning: true }));
+
+      const clearCodexStreamEndTimer = () => {
+        if (!codexStreamEndTimerRef.current) return;
+        clearTimeout(codexStreamEndTimerRef.current);
+        codexStreamEndTimerRef.current = null;
+      };
+
+      const endExternalStreamIfNeeded = () => {
+        clearCodexStreamEndTimer();
+        if (!externalStreamRef.current) return;
+        updateExternalStreaming(false, 'codex');
+        onExternalStreamComplete?.('codex');
+      };
+
+      const scheduleExternalStreamEndFallback = () => {
+        // If Codex emits agent_message without a matching response_item(role=assistant),
+        // avoid getting stuck in "external streaming" forever.
+        clearCodexStreamEndTimer();
+        codexStreamEndTimerRef.current = setTimeout(() => {
+          endExternalStreamIfNeeded();
+        }, 600);
+      };
+
       // Track streaming state from Codex turn lifecycle
       for (const eventData of event.new_lines) {
-        if (eventData?.type === 'turn.started') {
-          externalStreamRef.current = true;
+        const wasExternalStreaming = externalStreamRef.current;
+
+        // Different Codex distributions emit different lifecycle events:
+        // - codex CLI: turn.started / turn.completed
+        // - codex_vscode rollout: turn_context + response_item(message, role=assistant)
+        if (eventData?.type === 'turn.started' || eventData?.type === 'turn_context') {
+          updateExternalStreaming(true, 'codex');
+          clearCodexStreamEndTimer();
         }
         if (eventData?.type === 'turn.completed' || eventData?.type === 'turn.failed') {
-          externalStreamRef.current = false;
-          onExternalStreamComplete?.('codex');
+          endExternalStreamIfNeeded();
+        }
+        if (eventData?.type === 'error') {
+          endExternalStreamIfNeeded();
         }
 
         // Optional queue-operation support (future-proof)
@@ -450,13 +565,38 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
           continue;
         }
 
+        // VSCode rollout: response_item(message, role=assistant) is the best available end marker.
+        const isRolloutFinalAssistantMessage =
+          eventData?.type === 'response_item' &&
+          eventData?.payload?.type === 'message' &&
+          eventData?.payload?.role === 'assistant';
+
+        // VSCode rollout sometimes emits agent_message; if response_item is missing, fallback ends the stream.
+        const isAgentMessage =
+          eventData?.type === 'event_msg' &&
+          eventData?.payload?.type === 'agent_message';
+        if (isAgentMessage && externalStreamRef.current) {
+          scheduleExternalStreamEndFallback();
+        }
+
         // Convert to display message (if any)
-        const rawMsg = converter.convertEventObject(eventData);
+        let rawMsg: ClaudeStreamMessage | null = null;
+        try {
+          rawMsg = converter.convertEventObject(eventData);
+        } catch (err) {
+          console.warn('[SessionFileWatcher] Failed to convert Codex event:', err, eventData);
+          continue;
+        }
         if (!rawMsg) continue;
         const msg = sanitizeMessageForDisplay(rawMsg);
 
         // Track prompt index/text for mapping file changes -> prompt
         if (msg.type === 'user') {
+          // A user message may indicate an external prompt was just enqueued; treat as stream start
+          // only if we weren't already streaming.
+          if (!externalStreamRef.current) {
+            updateExternalStreaming(true, 'codex');
+          }
           codexPromptIndexRef.current += 1;
           codexPromptTextRef.current = extractPromptText(msg);
         }
@@ -464,19 +604,26 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
         // Record file changes for Codex change history (right panel)
         processCodexMessageForChangeTracking(msg);
 
-        // If user message arrives while Codex is still streaming, show it as queued instead of inline
-        if (msg.type === 'user' && externalStreamRef.current) {
+        // If user message arrives while Codex is still streaming, show it inline and mark as queued
+        if (msg.type === 'user' && wasExternalStreaming) {
           const prompt = extractPromptText(msg);
           onExternalQueuedPrompt?.({
             engine: 'codex',
             prompt: prompt || '(queued)',
             source: 'suppressed_user_message',
             message: msg,
+            displayedInline: true,
           });
+          newMessages.push(msg);
           continue;
         }
 
         newMessages.push(msg);
+
+        // End marker: only after the final assistant response item (avoid ending on developer/system text)
+        if (isRolloutFinalAssistantMessage) {
+          endExternalStreamIfNeeded();
+        }
       }
     } else {
       // Claude/Gemini 格式
@@ -496,16 +643,16 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
 
         // Claude streaming completion marker
         if (eventData?.type === 'result') {
-          externalStreamRef.current = false;
+          updateExternalStreaming(false, event.engine);
           onExternalStreamComplete?.(event.engine);
         } else if (eventData?.type === 'assistant') {
-          externalStreamRef.current = true;
+          updateExternalStreaming(true, event.engine);
         }
 
         if (eventData.type && ['user', 'assistant', 'system', 'result', 'summary', 'thinking', 'tool_use'].includes(eventData.type)) {
           const msg = sanitizeMessageForDisplay(eventData as ClaudeStreamMessage);
 
-          // If user message appears while assistant is streaming, keep it in queue until complete
+          // If user message appears while assistant is streaming, show it inline and mark as queued
           if (msg.type === 'user' && externalStreamRef.current) {
             const prompt = extractPromptText(msg);
             onExternalQueuedPrompt?.({
@@ -513,7 +660,9 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
               prompt: prompt || '(queued)',
               source: 'suppressed_user_message',
               message: msg,
+              displayedInline: true,
             });
+            newMessages.push(msg);
             continue;
           }
 
@@ -526,7 +675,7 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
       console.log('[SessionFileWatcher] Adding', newMessages.length, 'new messages');
       setMessages(prev => [...prev, ...newMessages]);
     }
-  }, [session, isMountedRef, setMessages, onExternalQueuedPrompt, onExternalDequeued, onExternalStreamComplete, processCodexMessageForChangeTracking]);
+  }, [session, isMountedRef, setMessages, onExternalQueuedPrompt, onExternalDequeued, onExternalStreamComplete, processCodexMessageForChangeTracking, updateExternalStreaming]);
 
   /**
    * 手动刷新会话（重新加载所有消息）
@@ -544,7 +693,13 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
         const events = await api.loadCodexSessionHistory(session.id);
         const converter = new CodexEventConverter();
         for (const event of events) {
-          const msg = converter.convertEventObject(event);
+          let msg: ClaudeStreamMessage | null = null;
+          try {
+            msg = converter.convertEventObject(event);
+          } catch (err) {
+            console.warn('[SessionFileWatcher] Failed to convert Codex history event:', err, event);
+            continue;
+          }
           if (!msg) continue;
           history.push(sanitizeMessageForDisplay(msg));
         }

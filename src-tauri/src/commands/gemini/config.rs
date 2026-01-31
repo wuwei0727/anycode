@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use tauri::async_runtime;
 
 // ============================================================================
 // Configuration Types
@@ -362,7 +363,9 @@ pub async fn get_gemini_session_logs(project_path: String) -> Result<Vec<GeminiS
 /// List all sessions for a project
 #[tauri::command]
 pub async fn list_gemini_sessions(project_path: String) -> Result<Vec<GeminiSessionInfo>, String> {
-    list_session_files(&project_path)
+    async_runtime::spawn_blocking(move || list_session_files(&project_path))
+        .await
+        .map_err(|e| format!("Failed to load Gemini sessions: {}", e))?
 }
 
 /// Get detailed session information

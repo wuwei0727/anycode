@@ -254,46 +254,50 @@ pub async fn cancel_codex(
 /// Optimized: Uses walkdir for efficient directory traversal
 #[tauri::command]
 pub async fn list_codex_sessions() -> Result<Vec<CodexSession>, String> {
-    log::info!("list_codex_sessions called");
+    tauri::async_runtime::spawn_blocking(|| {
+        log::info!("list_codex_sessions called");
 
-    // Use unified sessions directory function (supports WSL)
-    let sessions_dir = get_codex_sessions_dir()?;
-    log::info!("Looking for Codex sessions in: {:?}", sessions_dir);
+        // Use unified sessions directory function (supports WSL)
+        let sessions_dir = get_codex_sessions_dir()?;
+        log::info!("Looking for Codex sessions in: {:?}", sessions_dir);
 
-    if !sessions_dir.exists() {
-        log::warn!("Codex sessions directory does not exist: {:?}", sessions_dir);
-        return Ok(Vec::new());
-    }
+        if !sessions_dir.exists() {
+            log::warn!("Codex sessions directory does not exist: {:?}", sessions_dir);
+            return Ok(Vec::new());
+        }
 
-    // Use walkdir for efficient recursive directory traversal
-    let mut sessions: Vec<CodexSession> = walkdir::WalkDir::new(&sessions_dir)
-        .min_depth(4) // Skip year/month/day directories, go directly to files
-        .max_depth(4) // Don't go deeper than needed
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().and_then(|s| s.to_str()) == Some("jsonl")
-        })
-        .filter_map(|e| {
-            let path = e.path();
-            match parse_codex_session_file(path) {
-                Some(session) => {
-                    log::debug!("Found session: {} ({})", session.id, session.project_path);
-                    Some(session)
+        // Use walkdir for efficient recursive directory traversal
+        let mut sessions: Vec<CodexSession> = walkdir::WalkDir::new(&sessions_dir)
+            .min_depth(4) // Skip year/month/day directories, go directly to files
+            .max_depth(4) // Don't go deeper than needed
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path().extension().and_then(|s| s.to_str()) == Some("jsonl")
+            })
+            .filter_map(|e| {
+                let path = e.path();
+                match parse_codex_session_file(path) {
+                    Some(session) => {
+                        log::debug!("Found session: {} ({})", session.id, session.project_path);
+                        Some(session)
+                    }
+                    None => {
+                        log::debug!("Failed to parse: {:?}", path);
+                        None
+                    }
                 }
-                None => {
-                    log::debug!("Failed to parse: {:?}", path);
-                    None
-                }
-            }
-        })
-        .collect();
+            })
+            .collect();
 
-    // Sort by creation time (newest first)
-    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        // Sort by creation time (newest first)
+        sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-    log::info!("Found {} Codex sessions", sessions.len());
-    Ok(sessions)
+        log::info!("Found {} Codex sessions", sessions.len());
+        Ok(sessions)
+    })
+    .await
+    .map_err(|e| format!("Failed to list Codex sessions: {}", e))?
 }
 
 /// Lists Codex sessions filtered by project path
@@ -301,118 +305,126 @@ pub async fn list_codex_sessions() -> Result<Vec<CodexSession>, String> {
 /// This avoids loading all sessions when only one project's sessions are needed
 #[tauri::command]
 pub async fn list_codex_sessions_for_project(project_path: String) -> Result<Vec<CodexSession>, String> {
-    log::info!("list_codex_sessions_for_project called for: {}", project_path);
+    tauri::async_runtime::spawn_blocking(move || {
+        log::info!("list_codex_sessions_for_project called for: {}", project_path);
 
-    let sessions_dir = get_codex_sessions_dir()?;
-    
-    if !sessions_dir.exists() {
-        return Ok(Vec::new());
-    }
+        let sessions_dir = get_codex_sessions_dir()?;
+        
+        if !sessions_dir.exists() {
+            return Ok(Vec::new());
+        }
 
-    // Normalize target path for comparison
-    let normalize_path = |p: &str| -> String {
-        p.replace('\\', "/").trim_end_matches('/').to_lowercase()
-    };
-    let target_path_norm = normalize_path(&project_path);
+        // Normalize target path for comparison
+        let normalize_path = |p: &str| -> String {
+            p.replace('\\', "/").trim_end_matches('/').to_lowercase()
+        };
+        let target_path_norm = normalize_path(&project_path);
 
-    let mut sessions: Vec<CodexSession> = walkdir::WalkDir::new(&sessions_dir)
-        .min_depth(4)
-        .max_depth(4)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
-        .filter_map(|e| {
-            let path = e.path();
-            // Quick check: read only first line to get project path
-            if let Some(session_path) = quick_extract_project_path(path) {
-                let session_path_norm = normalize_path(&session_path);
-                if session_path_norm == target_path_norm {
-                    // Full parse only if path matches
-                    return parse_codex_session_file(path);
+        let mut sessions: Vec<CodexSession> = walkdir::WalkDir::new(&sessions_dir)
+            .min_depth(4)
+            .max_depth(4)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
+            .filter_map(|e| {
+                let path = e.path();
+                // Quick check: read only first line to get project path
+                if let Some(session_path) = quick_extract_project_path(path) {
+                    let session_path_norm = normalize_path(&session_path);
+                    if session_path_norm == target_path_norm {
+                        // Full parse only if path matches
+                        return parse_codex_session_file(path);
+                    }
                 }
-            }
-            None
-        })
-        .collect();
+                None
+            })
+            .collect();
 
-    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    log::info!("Found {} Codex sessions for project {}", sessions.len(), project_path);
-    Ok(sessions)
+        sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        log::info!("Found {} Codex sessions for project {}", sessions.len(), project_path);
+        Ok(sessions)
+    })
+    .await
+    .map_err(|e| format!("Failed to list Codex sessions: {}", e))?
 }
 
 /// Lists all Codex projects by grouping sessions by project path
 /// Returns a list of projects with session counts and last activity timestamps
 #[tauri::command]
 pub async fn list_codex_projects() -> Result<Vec<CodexProject>, String> {
-    log::info!("list_codex_projects called");
+    tauri::async_runtime::spawn_blocking(|| {
+        log::info!("list_codex_projects called");
 
-    let sessions_dir = get_codex_sessions_dir()?;
-    log::info!("Looking for Codex projects in: {:?}", sessions_dir);
+        let sessions_dir = get_codex_sessions_dir()?;
+        log::info!("Looking for Codex projects in: {:?}", sessions_dir);
 
-    if !sessions_dir.exists() {
-        log::warn!("Codex sessions directory does not exist: {:?}", sessions_dir);
-        return Ok(Vec::new());
-    }
+        if !sessions_dir.exists() {
+            log::warn!("Codex sessions directory does not exist: {:?}", sessions_dir);
+            return Ok(Vec::new());
+        }
 
-    // Collect all sessions and group by project path
-    let mut projects_map: std::collections::HashMap<String, CodexProject> = std::collections::HashMap::new();
+        // Collect all sessions and group by project path
+        let mut projects_map: std::collections::HashMap<String, CodexProject> = std::collections::HashMap::new();
 
-    // Helper to normalize path for grouping
-    let normalize_path = |p: &str| -> String {
-        p.replace('\\', "/").trim_end_matches('/').to_lowercase()
-    };
+        // Helper to normalize path for grouping
+        let normalize_path = |p: &str| -> String {
+            p.replace('\\', "/").trim_end_matches('/').to_lowercase()
+        };
 
-    // Filter out clearly-noisy "projects" that users don't consider real projects.
-    // These often come from clipboard/temp workflows and pollute the project list.
-    let should_exclude_project_path = |p: &str| -> bool {
-        let norm = normalize_path(p);
-        norm.contains("claude_workbench_clipboard_images")
-            || norm.contains("appdata/local/temp")
-            || norm.contains("/tmp/")
-    };
+        // Filter out clearly-noisy "projects" that users don't consider real projects.
+        // These often come from clipboard/temp workflows and pollute the project list.
+        let should_exclude_project_path = |p: &str| -> bool {
+            let norm = normalize_path(p);
+            norm.contains("claude_workbench_clipboard_images")
+                || norm.contains("appdata/local/temp")
+                || norm.contains("/tmp/")
+        };
 
-    for entry in walkdir::WalkDir::new(&sessions_dir)
-        .min_depth(4)
-        .max_depth(4)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
-    {
-        let path = entry.path();
-        
-        // Quick extract project path and session info
-        if let Some((project_path, session_id, updated_at)) = quick_extract_project_info(path) {
-            // Skip noise paths and non-existing directories
-            if should_exclude_project_path(&project_path) {
-                continue;
-            }
-            if !std::path::Path::new(&project_path).exists() {
-                continue;
-            }
-
-            let normalized = normalize_path(&project_path);
+        for entry in walkdir::WalkDir::new(&sessions_dir)
+            .min_depth(4)
+            .max_depth(4)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        {
+            let path = entry.path();
             
-            let project = projects_map.entry(normalized).or_insert_with(|| CodexProject {
-                project_path: project_path.clone(),
-                sessions: Vec::new(),
-                session_count: 0,
-                last_activity: 0,
-            });
-            
-            project.sessions.push(session_id);
-            project.session_count += 1;
-            if updated_at > project.last_activity {
-                project.last_activity = updated_at;
+            // Quick extract project path and session info
+            if let Some((project_path, session_id, updated_at)) = quick_extract_project_info(path) {
+                // Skip noise paths and non-existing directories
+                if should_exclude_project_path(&project_path) {
+                    continue;
+                }
+                if !std::path::Path::new(&project_path).exists() {
+                    continue;
+                }
+
+                let normalized = normalize_path(&project_path);
+                
+                let project = projects_map.entry(normalized).or_insert_with(|| CodexProject {
+                    project_path: project_path.clone(),
+                    sessions: Vec::new(),
+                    session_count: 0,
+                    last_activity: 0,
+                });
+                
+                project.sessions.push(session_id);
+                project.session_count += 1;
+                if updated_at > project.last_activity {
+                    project.last_activity = updated_at;
+                }
             }
         }
-    }
 
-    // Convert to vector and sort by last activity (newest first)
-    let mut projects: Vec<CodexProject> = projects_map.into_values().collect();
-    projects.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+        // Convert to vector and sort by last activity (newest first)
+        let mut projects: Vec<CodexProject> = projects_map.into_values().collect();
+        projects.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
 
-    log::info!("Found {} Codex projects", projects.len());
-    Ok(projects)
+        log::info!("Found {} Codex projects", projects.len());
+        Ok(projects)
+    })
+    .await
+    .map_err(|e| format!("Failed to list Codex projects: {}", e))?
 }
 
 /// Quick extraction of project info from session file (reads only first few lines)
@@ -792,7 +804,6 @@ pub fn find_session_file(
         return Err(err);
     }
 
-    let mut files_searched = 0;
     let mut jsonl_files = 0;
 
     for entry in WalkDir::new(sessions_dir).into_iter().flatten() {
@@ -800,8 +811,6 @@ pub fn find_session_file(
         
         if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
             jsonl_files += 1;
-            files_searched += 1;
-
             log::debug!("[find_session_file] Checking file: {:?}", path);
 
             match std::fs::File::open(path) {

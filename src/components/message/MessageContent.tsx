@@ -192,19 +192,199 @@ const MessageContentComponent: React.FC<MessageContentProps> = ({
   const normalizedTextToDisplay = useMemo(() => {
     if (shouldEnableTypewriter) return textToDisplay;
 
+    // Common section titles produced by this app / Codex workflows.
+    // If we detect multiple titles, we can reorder sections to a stable, VSCode-like layout.
+    const SECTION_ALIASES: Record<string, string[]> = {
+      '变更摘要': ['变更摘要', 'Change Summary', 'Summary', 'Changelog', 'Changes'],
+      '改动文件清单': ['改动文件清单', '改动文件列表', 'Files Changed', 'Changed Files', 'File List', 'Files'],
+      '关键实现说明': ['关键实现说明', '关键实现', 'Key Implementation', 'Implementation Notes', 'Details'],
+      '如何验证': ['如何验证', '验证方式', 'How to Verify', 'Verification', 'How to run', 'How to test'],
+      '对比说明': ['对比说明', '对比', 'Comparison', 'Diff', 'What changed'],
+      // Existing generic titles
+      '涉及文件': ['涉及文件'],
+      '下一步可选': ['下一步可选', 'Next steps'],
+      '为什么这样改': ['为什么这样改', 'Why'],
+    };
+
+    const SECTION_ORDER = [
+      '变更摘要',
+      '改动文件清单',
+      '关键实现说明',
+      '如何验证',
+      '对比说明',
+    ] as const;
+
+    const normalizeTitleKey = (line: string): string => {
+      let t = line.trim();
+      t = t.replace(/^#{1,6}\s+/, ''); // markdown headings
+      t = t.replace(/^\*\*(.+)\*\*$/, '$1').trim(); // bold-only title
+      t = t.replace(/^__([^_]+)__$/, '$1').trim();
+      t = t.replace(/[:：]\s*$/, '').trim();
+      return t;
+    };
+
+    const getCanonicalSectionTitle = (line: string): string | null => {
+      const key = normalizeTitleKey(line);
+      if (!key) return null;
+      const keyLower = key.toLowerCase();
+      for (const [canonical, aliases] of Object.entries(SECTION_ALIASES)) {
+        for (const alias of aliases) {
+          if (!alias) continue;
+          if (alias.toLowerCase() === keyLower) return canonical;
+        }
+      }
+      return null;
+    };
+
+    const sortSimpleFileList = (lines: string[]): string[] => {
+      const nonEmpty = lines.filter((l) => l.trim().length > 0);
+      if (nonEmpty.length === 0) return lines;
+
+      const isTopLevelBullet = (l: string) => /^[-*]\s+/.test(l.trimStart()) && !/^\s{2,}[-*]\s+/.test(l);
+      if (!nonEmpty.every(isTopLevelBullet)) return lines;
+
+      const extractKey = (l: string) => {
+        const raw = l.trimStart().replace(/^[-*]\s+/, '').trim();
+        // unwrap inline code if present
+        const unwrapped = raw.replace(/^`(.+)`$/, '$1').trim();
+        return unwrapped.toLowerCase();
+      };
+
+      return [...lines].sort((a, b) => extractKey(a).localeCompare(extractKey(b)));
+    };
+
+    const normalizeHowToVerify = (lines: string[]): string[] => {
+      // Make bullets under an ordered list item appear nested (VSCode renders this more readably).
+      const out: string[] = [];
+      let inOrderedItem = false;
+      for (const line of lines) {
+        const trimmed = line.trim();
+        const isBlank = trimmed.length === 0;
+        const isOrdered = /^\d+[.)]\s+/.test(trimmed);
+        const isBullet = /^[-*]\s+/.test(trimmed);
+
+        if (isBlank) {
+          inOrderedItem = false;
+          out.push(line);
+          continue;
+        }
+
+        if (isOrdered) {
+          inOrderedItem = true;
+          out.push(line);
+          continue;
+        }
+
+        if (isBullet && inOrderedItem && !/^\s{2,}[-*]\s+/.test(line)) {
+          out.push(`   ${trimmed}`);
+          continue;
+        }
+
+        // Any other content breaks the "nested bullet" heuristic.
+        inOrderedItem = false;
+        out.push(line);
+      }
+      return out;
+    };
+
+    const reorderSectionsIfMatched = (text: string): string => {
+      const lines = text.split(/\r?\n/);
+
+      type Section = { title: string; lines: string[]; orderIndex: number; originalPos: number };
+      const sections: Section[] = [];
+      const intro: string[] = [];
+
+      let current: Section | null = null;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const canonical = getCanonicalSectionTitle(line);
+        if (canonical) {
+          if (current) sections.push(current);
+          const orderIndex = SECTION_ORDER.indexOf(canonical as any);
+          current = { title: canonical, lines: [], orderIndex: orderIndex >= 0 ? orderIndex : 999, originalPos: i };
+          continue;
+        }
+
+        if (!current) {
+          intro.push(line);
+        } else {
+          current.lines.push(line);
+        }
+      }
+      if (current) sections.push(current);
+
+      // Only reorder if we have multiple known sections (avoid mutating normal chats).
+      const uniqueTitles = new Set(sections.map((s) => s.title));
+      if (uniqueTitles.size < 2) return text;
+
+      // Per-section tweaks
+      for (const s of sections) {
+        if (s.title === '改动文件清单') {
+          s.lines = sortSimpleFileList(s.lines);
+        } else if (s.title === '如何验证') {
+          s.lines = normalizeHowToVerify(s.lines);
+        }
+      }
+
+      const ordered = [...sections].sort((a, b) => {
+        if (a.orderIndex !== b.orderIndex) return a.orderIndex - b.orderIndex;
+        return a.originalPos - b.originalPos;
+      });
+
+      const out: string[] = [];
+      const introText = intro.join('\n').trim();
+      if (introText) {
+        out.push(introText);
+        out.push('');
+      }
+
+      for (const s of ordered) {
+        out.push(s.title);
+        out.push(...s.lines);
+        // Ensure a blank line between sections
+        if (out.length > 0 && out[out.length - 1].trim() !== '') out.push('');
+      }
+
+      return out.join('\n').trim();
+    };
+
+    const normalizedReport = reorderSectionsIfMatched(textToDisplay);
+
     const normalizeTitle = (line: string) => {
       const t = line.trim();
       const title = t.replace(/^\*\*(.+)\*\*$/, "$1").trim();
 
       // 仅提升常见“分节标题”到 Markdown Heading，避免误伤普通加粗
-      const knownTitles = new Set(["涉及文件", "下一步可选", "为什么这样改", "Why", "Next steps", "Files"]);
+      const knownTitles = new Set([
+        "变更摘要",
+        "改动文件清单",
+        "改动文件列表",
+        "关键实现说明",
+        "关键实现",
+        "如何验证",
+        "验证方式",
+        "对比说明",
+        "对比",
+        "涉及文件",
+        "下一步可选",
+        "为什么这样改",
+        "Why",
+        "Next steps",
+        "Files",
+        "Changed Files",
+        "Files Changed",
+        "Change Summary",
+        "Key Implementation",
+        "How to Verify",
+        "Comparison",
+      ]);
       if (knownTitles.has(title)) {
         return `### ${title}`;
       }
       return line;
     };
 
-    return textToDisplay
+    return normalizedReport
       .split(/\r?\n/)
       .map(normalizeTitle)
       .join("\n");

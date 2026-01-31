@@ -20,6 +20,7 @@ import type { ClaudeStreamMessage } from '@/types/claude';
 import type { ModelType } from '@/components/FloatingPromptInput/types';
 // 🔧 FIX: 导入 CodexEventConverter 类，在每个会话中创建独立实例避免全局单例污染
 import { CodexEventConverter } from '@/lib/codexConverter';
+import { extractFilePathFromPatchText, extractOldNewFromPatchText, splitPatchIntoFileChunks } from '@/lib/codexDiff';
 import type { CodexExecutionMode } from '@/types/codex';
 
 // ============================================================================
@@ -60,6 +61,7 @@ interface UsePromptExecutionConfig {
   // State
   projectPath: string;
   isLoading: boolean;
+  externalIsStreaming?: boolean;
   claudeSessionId: string | null;
   effectiveSession: Session | null;
   isPlanMode: boolean;
@@ -110,6 +112,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
   const {
     projectPath,
     isLoading,
+    externalIsStreaming = false,
     claudeSessionId,
     effectiveSession,
     isPlanMode,
@@ -191,7 +194,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
     console.log('[usePromptExecution] Using model:', model);
 
     // If already loading, queue the prompt
-    if (isLoading) {
+    if (isLoading || externalIsStreaming) {
       const newPrompt: QueuedPrompt = {
         id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         prompt,
@@ -297,19 +300,41 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
 
           // 🔧 FIX: Track current Codex session ID for channel isolation
           let currentCodexSessionId: string | null = null;
+          // Track Codex thread_id for global fallback filtering
+          let currentCodexThreadId: string | null = codexPendingInfo?.sessionId || effectiveSession?.id || null;
           // 🔧 FIX: Track processed message IDs to prevent duplicates
           const processedCodexMessages = new Set<string>();
           // 🔧 FIX: Track pending prompt recording Promise to avoid race condition
           let pendingPromptRecordingPromise: Promise<void> | null = null;
 
+          // Track tool_use/tool_result IDs so we can clear "pending" tool spinners when the session ends.
+          const codexToolUseIds = new Set<string>();
+          const codexToolResultIds = new Set<string>();
+
+          // Codex backend may emit `codex-complete` before the last `codex-output` lines are flushed.
+          // Keep listeners alive briefly until the stream is quiet, then finalize.
+          let codexCompleteRequested = false;
+          let codexFinalizeInProgress = false;
+          let codexFinalizeTimer: ReturnType<typeof setTimeout> | null = null;
+          let codexForceFinalizeTimer: ReturnType<typeof setTimeout> | null = null;
+
           // 🆕 Change tracker:
           // - Track file-related tool_use -> snapshot old content
           // - On tool_result -> read new content from disk and persist a full diff to backend
-          const trackedCodexFileTools = new Map<string, {
+          type TrackedCodexFileToolEntry = {
             filePath: string;
             changeType: 'create' | 'update' | 'delete' | 'auto';
             oldContentPromise: Promise<string | null>;
             fallbackNewContent: string;
+            diffHint?: string;
+            toolName?: string;
+            toolNewContent?: string;
+          };
+
+          // One tool_use can patch multiple files (multi-file apply_patch). Track per tool_use_id,
+          // but store multiple entries so "files changed" matches the official plugin.
+          const trackedCodexFileTools = new Map<string, {
+            entries: TrackedCodexFileToolEntry[];
             fallbackTimer?: ReturnType<typeof setTimeout> | null;
           }>();
           const recordedCodexFileToolIds = new Set<string>();
@@ -377,6 +402,82 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
             }
           };
 
+          const finalizeToolChange = (toolUseId: string) => {
+            const tracked = trackedCodexFileTools.get(toolUseId);
+            if (!tracked || tracked.entries.length === 0) return;
+            if (recordedCodexFileToolIds.has(toolUseId)) return;
+            recordedCodexFileToolIds.add(toolUseId);
+
+            if (tracked.fallbackTimer) {
+              clearTimeout(tracked.fallbackTimer);
+              tracked.fallbackTimer = null;
+            }
+
+            (async () => {
+              try {
+                // Ensure promptIndex has been recorded (new sessions have async recordCodexPromptSent)
+                if (pendingPromptRecordingPromise) {
+                  await pendingPromptRecordingPromise;
+                }
+
+                const codexThreadId = codexPendingInfo?.sessionId;
+                const promptIndex = codexPendingInfo?.promptIndex;
+
+                if (!codexThreadId) {
+                  console.warn('[CodexChangeTracker] Missing Codex thread_id, skip recording:', { toolUseId });
+                  return;
+                }
+                if (promptIndex === undefined) {
+                  console.warn('[CodexChangeTracker] Missing promptIndex, skip recording:', { toolUseId, codexThreadId });
+                  return;
+                }
+
+                for (const entry of tracked.entries) {
+                  const oldContent = await entry.oldContentPromise;
+                  const resolvedChangeType =
+                    entry.changeType === 'auto'
+                      ? (oldContent !== null ? 'update' : 'create')
+                      : entry.changeType;
+
+                  const diskNewContent = resolvedChangeType === 'delete' ? null : await safeReadFile(entry.filePath);
+                  const newContent =
+                    (diskNewContent ?? entry.toolNewContent ?? entry.fallbackNewContent) || '';
+                  const oldContentToSend = resolvedChangeType === 'create' ? null : (oldContent ?? '');
+
+                  const changeId = await api.codexRecordFileChange(
+                    codexThreadId,
+                    projectPath,
+                    entry.filePath,
+                    resolvedChangeType,
+                    'tool',
+                    promptIndex,
+                    codexPendingInfo?.promptText || '',
+                    newContent,
+                    oldContentToSend,
+                    entry.toolName || null,
+                    toolUseId,
+                    entry.diffHint || null
+                  );
+
+                  console.log('[CodexChangeTracker] Recorded file change:', {
+                    changeId,
+                    changeType: resolvedChangeType,
+                    filePath: entry.filePath,
+                    promptIndex,
+                  });
+                }
+              } catch (err) {
+                console.warn('[CodexChangeTracker] Failed to record file change:', err);
+              } finally {
+                trackedCodexFileTools.delete(toolUseId);
+              }
+            })();
+          };
+
+          const finalizeAllTrackedFileTools = () => {
+            Array.from(trackedCodexFileTools.keys()).forEach((id) => finalizeToolChange(id));
+          };
+
           // Helper function to generate message ID for deduplication
           const getCodexMessageId = (payload: string): string => {
             // Use payload hash as ID since Codex doesn't provide unique message IDs
@@ -387,6 +488,19 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
               hash = hash & hash;
             }
             return `codex-${hash}`;
+          };
+
+          const extractCodexThreadId = (payload: string): string | null => {
+            try {
+              const data = JSON.parse(payload);
+              if (typeof data?.thread_id === 'string') return data.thread_id;
+              if (typeof data?.session_id === 'string') return data.session_id;
+              if (typeof data?.payload?.thread_id === 'string') return data.payload.thread_id;
+              if (typeof data?.payload?.session_id === 'string') return data.payload.session_id;
+            } catch {
+              return null;
+            }
+            return null;
           };
 
           // Helper function to process Codex output
@@ -404,6 +518,22 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
             // 🔧 FIX: 使用会话级别的转换器实例
             const message = sessionCodexConverter.convertEvent(payload);
             if (message) {
+              const activePromptIndex =
+                codexPendingInfo?.promptIndex ?? window.__codexPendingPrompt?.promptIndex;
+              if (activePromptIndex !== undefined && activePromptIndex !== null) {
+                (message as any).codexPromptIndex = activePromptIndex;
+              }
+              const contentBlocksAny = message.message?.content;
+              if (Array.isArray(contentBlocksAny)) {
+                for (const block of contentBlocksAny as any[]) {
+                  if (block?.type === 'tool_use' && typeof block?.id === 'string') {
+                    codexToolUseIds.add(block.id);
+                  } else if (block?.type === 'tool_result' && typeof block?.tool_use_id === 'string') {
+                    codexToolResultIds.add(block.tool_use_id);
+                  }
+                }
+              }
+
               setMessages(prev => [...prev, message]);
               setRawJsonlOutput((prev) => [...prev, payload]);
 
@@ -412,71 +542,6 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
               if (message.type === 'assistant' && message.message?.content) {
                 const contentBlocks = message.message.content as any[];
 
-                const finalizeToolChange = (toolUseId: string) => {
-                  const tracked = trackedCodexFileTools.get(toolUseId);
-                  if (!tracked) return;
-                  if (recordedCodexFileToolIds.has(toolUseId)) return;
-                  recordedCodexFileToolIds.add(toolUseId);
-
-                  if (tracked.fallbackTimer) {
-                    clearTimeout(tracked.fallbackTimer);
-                    tracked.fallbackTimer = null;
-                  }
-
-                  (async () => {
-                    try {
-                      // Ensure promptIndex has been recorded (new sessions have async recordCodexPromptSent)
-                      if (pendingPromptRecordingPromise) {
-                        await pendingPromptRecordingPromise;
-                      }
-
-                      const codexThreadId = codexPendingInfo?.sessionId;
-                      const promptIndex = codexPendingInfo?.promptIndex;
-
-                      if (!codexThreadId) {
-                        console.warn('[CodexChangeTracker] Missing Codex thread_id, skip recording:', { filePath: tracked.filePath });
-                        return;
-                      }
-                      if (promptIndex === undefined) {
-                        console.warn('[CodexChangeTracker] Missing promptIndex, skip recording:', { filePath: tracked.filePath, codexThreadId });
-                        return;
-                      }
-
-                      const oldContent = await tracked.oldContentPromise;
-                      const resolvedChangeType =
-                        tracked.changeType === 'auto'
-                          ? (oldContent !== null ? 'update' : 'create')
-                          : tracked.changeType;
-
-                      const diskNewContent = resolvedChangeType === 'delete' ? null : await safeReadFile(tracked.filePath);
-                      const newContent = diskNewContent ?? tracked.fallbackNewContent;
-
-                      const changeId = await api.codexRecordFileChange(
-                        codexThreadId,
-                        projectPath,
-                        tracked.filePath,
-                        resolvedChangeType,
-                        'tool',
-                        promptIndex,
-                        codexPendingInfo?.promptText || '',
-                        newContent,
-                        oldContent
-                      );
-
-                      console.log('[CodexChangeTracker] Recorded file change:', {
-                        changeId,
-                        changeType: resolvedChangeType,
-                        filePath: tracked.filePath,
-                        promptIndex,
-                      });
-                    } catch (err) {
-                      console.warn('[CodexChangeTracker] Failed to record file change:', err);
-                    } finally {
-                      trackedCodexFileTools.delete(toolUseId);
-                    }
-                  })();
-                };
-
                 // 1) tool_use -> start tracking (snapshot old content)
                 for (const block of contentBlocks) {
                   if (block?.type !== 'tool_use') continue;
@@ -484,68 +549,109 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
                   const toolUseId: string | undefined = block?.id;
                   const toolName: string | undefined = block?.name;
                   const toolInput: any = block?.input || {};
-                  const filePath: string | undefined =
-                    toolInput?.file_path ||
-                    toolInput?.path ||
-                    toolInput?.file ||
-                    toolInput?.filename;
-
-                  if (!toolUseId || !filePath) continue;
-
-                  // Determine change type
-                  let changeType: 'create' | 'update' | 'delete' | 'auto' | null = null;
-                  if (typeof toolInput?.change_type === 'string' && ['create', 'update', 'delete'].includes(toolInput.change_type)) {
-                    changeType = toolInput.change_type;
-                  } else if (toolName === 'write' || toolName === 'create_file') {
-                    changeType = 'auto';
-                  } else if (toolName === 'edit') {
-                    changeType = 'update';
-                  } else if (toolName === 'delete_file' || toolName === 'remove_file') {
-                    changeType = 'delete';
-                  }
-
-                  if (!changeType) continue;
-                  if (trackedCodexFileTools.has(toolUseId)) continue;
-
-                  const normalizedFilePath = normalizeRecordedPath(filePath);
-
-                  const oldContentPromise = (async () => {
-                    const diskOld = await safeReadFile(normalizedFilePath);
-                    if (diskOld !== null) return diskOld;
-                    // fallback (best-effort) when disk read fails
-                    if (typeof toolInput?.old_string === 'string') return toolInput.old_string;
-                    return null;
-                  })();
-
-                  const fallbackNewContent =
-                    typeof toolInput?.content === 'string'
-                      ? toolInput.content
-                      : typeof toolInput?.new_string === 'string'
-                      ? toolInput.new_string
-                      : typeof toolInput?.patch === 'string'
-                      ? toolInput.patch
-                      : typeof toolInput?.diff === 'string'
-                      ? toolInput.diff
-                      : '';
-
-                  trackedCodexFileTools.set(toolUseId, {
-                    filePath: normalizedFilePath,
-                    changeType,
-                    oldContentPromise,
-                    fallbackNewContent,
-                    fallbackTimer: null,
-                  });
-
-                  // Fallback: some Codex file tools (notably apply_patch) may not emit a tool_result.
-                  // If we detect an apply_patch-like payload, schedule a best-effort finalize.
                   const patchText =
                     typeof toolInput?.patch === 'string'
                       ? toolInput.patch
+                      : typeof toolInput?.diff === 'string'
+                      ? toolInput.diff
                       : typeof toolInput?.raw_input === 'string'
                       ? toolInput.raw_input
                       : '';
+                  if (!toolUseId) continue;
+                  if (trackedCodexFileTools.has(toolUseId)) continue;
 
-                  if (typeof patchText === 'string' && patchText.includes('*** Begin Patch')) {
+                  const toolNameLower = (toolName || '').toLowerCase();
+
+                  const inferChangeTypeFromPatch = (text: string): 'create' | 'update' | 'delete' | null => {
+                    if (!text) return null;
+                    if (text.includes('*** Add File:') || text.includes('*** Create File:')) return 'create';
+                    if (text.includes('*** Delete File:')) return 'delete';
+                    if (text.includes('*** Update File:')) return 'update';
+                    if (text.includes('--- /dev/null') || text.includes('new file mode')) return 'create';
+                    if (text.includes('+++ /dev/null') || text.includes('deleted file mode')) return 'delete';
+                    if (text.includes('@@')) return 'update';
+                    return null;
+                  };
+
+                  const chunks = patchText ? splitPatchIntoFileChunks(patchText) : [];
+                  const inputFilePath: string | null =
+                    toolInput?.file_path || toolInput?.path || toolInput?.file || toolInput?.filename || null;
+
+                  const fileTargets =
+                    chunks.length > 0
+                      ? chunks
+                      : inputFilePath
+                      ? [{ filePath: String(inputFilePath), patchText }]
+                      : patchText
+                      ? (() => {
+                          const fp = extractFilePathFromPatchText(patchText);
+                          return fp ? [{ filePath: fp, patchText }] : [];
+                        })()
+                      : [];
+
+                  if (fileTargets.length === 0) continue;
+
+                  const entries = fileTargets
+                    .map((target): TrackedCodexFileToolEntry | null => {
+                      const rawPath = String(target.filePath || '').trim();
+                      if (!rawPath) return null;
+
+                      const normalizedFilePath = normalizeRecordedPath(rawPath);
+                      const chunkPatchText = String(target.patchText || '');
+                      const patchDiff = chunkPatchText ? extractOldNewFromPatchText(chunkPatchText) : null;
+
+                      // Determine change type (per-file when patch contains multiple files)
+                      let changeType: 'create' | 'update' | 'delete' | 'auto' | null = null;
+                      if (typeof toolInput?.change_type === 'string' && ['create', 'update', 'delete'].includes(toolInput.change_type) && fileTargets.length === 1) {
+                        changeType = toolInput.change_type;
+                      } else if (chunkPatchText) {
+                        changeType = inferChangeTypeFromPatch(chunkPatchText);
+                      }
+
+                      if (!changeType) {
+                        if (toolNameLower === 'write') changeType = 'auto';
+                        else if (toolNameLower === 'edit' || toolNameLower === 'multiedit') changeType = 'update';
+                      }
+
+                      if (!changeType) return null;
+
+                      const oldContentPromise = (async () => {
+                        const diskOld = await safeReadFile(normalizedFilePath);
+                        if (diskOld !== null) return diskOld;
+                        // fallback (best-effort) when disk read fails
+                        if (patchDiff?.oldText) return patchDiff.oldText;
+                        if (typeof toolInput?.old_string === 'string') return toolInput.old_string;
+                        return null;
+                      })();
+
+                      const toolNewContent =
+                        typeof toolInput?.content === 'string'
+                          ? toolInput.content
+                          : typeof toolInput?.new_string === 'string'
+                          ? toolInput.new_string
+                          : patchDiff?.newText || undefined;
+
+                      const fallbackNewContent = patchDiff?.newText || '';
+
+                      return {
+                        filePath: normalizedFilePath,
+                        changeType,
+                        oldContentPromise,
+                        fallbackNewContent,
+                        diffHint: chunkPatchText && chunkPatchText.trim().length > 0 ? chunkPatchText : undefined,
+                        toolName: toolNameLower,
+                        toolNewContent,
+                      };
+                    })
+                    .filter((v): v is TrackedCodexFileToolEntry => Boolean(v));
+
+                  if (entries.length === 0) continue;
+
+                  trackedCodexFileTools.set(toolUseId, { entries, fallbackTimer: null });
+
+                  // Fallback: some Codex file tools (notably apply_patch) may not emit a tool_result.
+                  // If we detect an apply_patch-like payload, schedule a best-effort finalize.
+                  if (typeof patchText === 'string' && (patchText.includes('*** Begin Patch') || patchText.includes('diff --git'))) {
                     const existing = trackedCodexFileTools.get(toolUseId);
                     if (existing && !existing.fallbackTimer) {
                       existing.fallbackTimer = setTimeout(() => {
@@ -570,6 +676,9 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
               // Here we only save the thread_id for session resuming purposes (different from channel ID)
               if (message.type === 'system' && message.subtype === 'init' && (message as any).session_id) {
                 const codexThreadId = (message as any).session_id;  // This is the Codex thread_id
+                if (codexThreadId && !currentCodexThreadId) {
+                  currentCodexThreadId = codexThreadId;
+                }
                 // 🔧 FIX: Don't override claudeSessionId here - it's already set to backend channel ID
                 // setClaudeSessionId(codexThreadId);  // REMOVED - would break event channel subscription
 
@@ -611,11 +720,90 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
                   };
                 }
               }
+
+              // If Codex already signaled completion, keep delaying final cleanup until the output stream is quiet.
+              if (codexCompleteRequested && !codexFinalizeInProgress) {
+                scheduleCodexFinalize();
+              }
+            }
+          };
+
+          const CODEX_FINALIZE_QUIET_MS = 800;
+          const CODEX_FINALIZE_FORCE_MS = 8000;
+
+          const clearCodexFinalizeTimers = () => {
+            if (codexFinalizeTimer) clearTimeout(codexFinalizeTimer);
+            codexFinalizeTimer = null;
+            if (codexForceFinalizeTimer) clearTimeout(codexForceFinalizeTimer);
+            codexForceFinalizeTimer = null;
+          };
+
+          const finalizeCodexComplete = async () => {
+            if (codexFinalizeInProgress) return;
+            codexFinalizeInProgress = true;
+            clearCodexFinalizeTimers();
+
+            // Best-effort: if we missed the last tool_result events (or they never existed),
+            // synthesize empty tool_result blocks so the UI doesn't stay "pending" forever.
+            const missingToolResults = Array.from(codexToolUseIds).filter((id) => !codexToolResultIds.has(id));
+            if (missingToolResults.length > 0) {
+              const now = new Date().toISOString();
+              const activePromptIndex =
+                codexPendingInfo?.promptIndex ?? window.__codexPendingPrompt?.promptIndex;
+              setMessages((prev) => [
+                ...prev,
+                {
+                  type: 'assistant',
+                  message: {
+                    role: 'assistant',
+                    content: missingToolResults.map((toolUseId) => ({
+                      type: 'tool_result',
+                      tool_use_id: toolUseId,
+                      content: '',
+                      is_error: false,
+                    })),
+                  },
+                  timestamp: now,
+                  receivedAt: now,
+                  engine: 'codex' as const,
+                  ...(activePromptIndex !== undefined && activePromptIndex !== null
+                    ? { codexPromptIndex: activePromptIndex }
+                    : {}),
+                  _toolResultOnly: true,
+                } as ClaudeStreamMessage,
+              ]);
+              missingToolResults.forEach((id) => codexToolResultIds.add(id));
+            }
+
+            // Also finalize any tracked file tools so change-records doesn't miss the tail.
+            finalizeAllTrackedFileTools();
+
+            await processCodexComplete();
+          };
+
+          const scheduleCodexFinalize = () => {
+            if (!codexCompleteRequested || codexFinalizeInProgress) return;
+            if (codexFinalizeTimer) clearTimeout(codexFinalizeTimer);
+            codexFinalizeTimer = setTimeout(() => {
+              void finalizeCodexComplete();
+            }, CODEX_FINALIZE_QUIET_MS);
+          };
+
+          const requestCodexComplete = () => {
+            if (codexCompleteRequested) return;
+            codexCompleteRequested = true;
+            scheduleCodexFinalize();
+
+            if (!codexForceFinalizeTimer) {
+              codexForceFinalizeTimer = setTimeout(() => {
+                void finalizeCodexComplete();
+              }, CODEX_FINALIZE_FORCE_MS);
             }
           };
 
           // Helper function to process Codex completion
           const processCodexComplete = async () => {
+            clearCodexFinalizeTimers();
             setIsLoading(false);
             hasActiveSessionRef.current = false;
             isListeningRef.current = false;
@@ -667,9 +855,9 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
               processCodexOutput(evt.payload);
             });
 
-            const specificCompleteUnlisten = await listen<boolean>(`codex-complete:${sessionId}`, async () => {
+            const specificCompleteUnlisten = await listen<boolean>(`codex-complete:${sessionId}`, () => {
               console.log('[usePromptExecution] Received codex-complete (session-specific):', sessionId);
-              await processCodexComplete();
+              requestCodexComplete();
             });
 
             const specificErrorUnlisten = await listen<string>(`codex-error:${sessionId}`, (evt) => {
@@ -677,9 +865,8 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
               setError(evt.payload);
             });
 
-            // Replace existing listeners with session-specific ones
-            unlistenRefs.current.forEach((u) => u && typeof u === 'function' && u());
-            unlistenRefs.current = [specificOutputUnlisten, specificCompleteUnlisten, specificErrorUnlisten];
+            // Keep global listeners for fallback; append session-specific listeners
+            unlistenRefs.current.push(specificOutputUnlisten, specificCompleteUnlisten, specificErrorUnlisten);
           };
 
           // 🔧 FIX: Listen for session init event to get session ID for channel isolation
@@ -697,19 +884,29 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
             }
           });
 
-          // 🔧 FIX: 移除全局监听器,避免跨会话串流
-          // Listen for Codex JSONL output (global fallback) - REMOVED to prevent cross-session data leakage
-          // 问题: 多个标签页都监听全局 'codex-output' 事件,导致消息被多个会话接收
-          // 解决: 仅在会话ID未知的早期阶段处理全局事件,且必须验证会话归属
+          // Global fallback listener: process only events that belong to this Codex thread
           const codexOutputUnlisten = await listen<string>('codex-output', (evt) => {
-            // 🔧 CRITICAL FIX: 只在尚未收到会话ID时处理全局事件
             if (!hasActiveSessionRef.current) return;
+
+            const payloadThreadId = extractCodexThreadId(evt.payload);
+            if (!currentCodexThreadId && payloadThreadId) {
+              currentCodexThreadId = payloadThreadId;
+            }
+
             if (currentCodexSessionId) {
-              // 已经有会话ID,不再处理全局事件(应该由会话特定监听器处理)
-              console.log('[usePromptExecution] Ignoring global codex-output (session-specific listener active)');
+              if (!payloadThreadId) {
+                console.log('[usePromptExecution] Ignoring global codex-output (session-specific listener active)');
+                return;
+              }
+              if (currentCodexThreadId && payloadThreadId !== currentCodexThreadId) {
+                console.log('[usePromptExecution] Ignoring global codex-output (thread mismatch)');
+                return;
+              }
+            } else if (currentCodexThreadId && payloadThreadId && payloadThreadId !== currentCodexThreadId) {
+              console.log('[usePromptExecution] Ignoring global codex-output (thread mismatch)');
               return;
             }
-            // 只在会话ID未知的早期阶段处理
+
             processCodexOutput(evt.payload);
           });
 
@@ -726,7 +923,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
 
           // 🔧 FIX: 移除全局完成事件监听器,避免跨会话串流
           // Listen for Codex completion (global fallback) - FIXED to prevent cross-session interference
-          const codexCompleteUnlisten = await listen<boolean>('codex-complete', async () => {
+          const codexCompleteUnlisten = await listen<boolean>('codex-complete', () => {
             // 🔧 CRITICAL FIX: 只在尚未收到会话ID时处理全局事件
             if (!hasActiveSessionRef.current) return;
             if (currentCodexSessionId) {
@@ -735,7 +932,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
               return;
             }
             console.log('[usePromptExecution] Received codex-complete (global fallback)');
-            await processCodexComplete();
+            requestCodexComplete();
           });
 
           unlistenRefs.current = [codexSessionInitUnlisten, codexOutputUnlisten, codexErrorUnlisten, codexCompleteUnlisten];
@@ -760,6 +957,16 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
               hash = hash & hash;
             }
             return `gemini-${hash}`;
+          };
+
+          const extractGeminiSessionId = (payload: string): string | null => {
+            try {
+              const data = JSON.parse(payload);
+              if (typeof data?.session_id === 'string') return data.session_id;
+            } catch {
+              return null;
+            }
+            return null;
           };
 
           // Helper function to convert Gemini unified message to ClaudeStreamMessage
@@ -1032,17 +1239,22 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
             };
           });
 
-          // 🔧 FIX: 移除全局监听器,避免跨会话串流
-          // Listen for Gemini output (global fallback) - FIXED to prevent cross-session data leakage
+          // Global fallback listener: process only events that match this Gemini backend session
           const geminiOutputUnlisten = await listen<string>('gemini-output', (evt) => {
-            // 🔧 CRITICAL FIX: 只在尚未收到会话ID时处理全局事件
             if (!hasActiveSessionRef.current) return;
+
+            const payloadSessionId = extractGeminiSessionId(evt.payload);
             if (currentGeminiSessionId) {
-              // 已经有会话ID,不再处理全局事件(应该由会话特定监听器处理)
-              console.log('[usePromptExecution] Ignoring global gemini-output (session-specific listener active)');
-              return;
+              if (!payloadSessionId) {
+                console.log('[usePromptExecution] Ignoring global gemini-output (missing session_id)');
+                return;
+              }
+              if (payloadSessionId !== currentGeminiSessionId) {
+                console.log('[usePromptExecution] Ignoring global gemini-output (session mismatch)');
+                return;
+              }
             }
-            // 只在会话ID未知的早期阶段处理
+
             processGeminiOutput(evt.payload);
           });
 
@@ -1661,6 +1873,7 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
   }, [
     projectPath,
     isLoading,
+    externalIsStreaming,
     claudeSessionId,
     effectiveSession,
     isPlanMode,
@@ -1688,6 +1901,20 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
     setIsFirstPrompt,
     processMessageWithTranslation
   ]);
+
+  // When external streaming finishes, drain one queued prompt (if any) to avoid interrupting
+  useEffect(() => {
+    if (externalIsStreaming || isLoading) return;
+    if (queuedPromptsRef.current.length === 0) return;
+    const [nextPrompt, ...remaining] = queuedPromptsRef.current;
+    setQueuedPrompts(remaining);
+
+    const timer = setTimeout(() => {
+      handleSendPrompt(nextPrompt.prompt, nextPrompt.model);
+    }, 100);
+
+    return () => clearTimeout(timer);
+  }, [externalIsStreaming, isLoading, queuedPromptsRef, setQueuedPrompts, handleSendPrompt]);
 
   // ============================================================================
   // Return Hook Interface

@@ -7,7 +7,7 @@
  * 设计参考：官方/插件式 “Finished working / 可折叠展开” 交互。
  */
 
-import React, { useEffect, useMemo, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { ChevronDown, ChevronUp, ChevronRight, CheckCircle2, Loader2, AlertCircle, FileText, BrainCircuit, Wrench, Pencil } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -18,10 +18,12 @@ import { FilePathLink } from "@/components/common/FilePathLink";
 import { parseFileReference } from "@/lib/fileLinkify";
 import { useToolResults } from "@/hooks/useToolResults";
 import { ChangedFilesSummary, type ChangedFileEntry } from "./ChangedFilesSummary";
+import { splitPatchIntoFileChunks } from "@/lib/codexDiff";
 import * as Diff from "diff";
 import { api } from "@/lib/api";
 import { CodexChangeDetailPage } from "@/components/codex/CodexChangeDetailPage";
 import type { CodexFileChange } from "@/types/codex-changes";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 interface ActivityMessageGroupProps {
   group: ActivityGroup;
@@ -68,10 +70,36 @@ function extractFilePathFromTool(tool: ToolUseBlock): string | null {
   if (name === "write") {
     return input.file_path || input.path || null;
   }
+  if (name === "create_file" || name === "delete_file" || name === "remove_file" || name === "write_file") {
+    return input.file_path || input.path || input.file || null;
+  }
+  if (name === "apply_patch" || name === "file_change") {
+    const patchText = String(input.patch || input.diff || input.raw_input || "");
+    const fromPatch = extractFilePathFromPatch(patchText);
+    return fromPatch || input.file_path || input.path || input.file || null;
+  }
 
   // 兼容部分 Codex/Gemini 变体
   if (input.file_path) return input.file_path;
   if (input.path && typeof input.path === "string" && input.path.includes(".")) return input.path;
+  return null;
+}
+
+function extractFilePathFromPatch(patchText?: string): string | null {
+  if (!patchText) return null;
+
+  const lines = patchText.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const m1 = trimmed.match(/^\*\*\*\s+(?:Update|Add|Create|Delete)\s+File:\s+(.+)$/i);
+    if (m1) return m1[1].trim();
+    const m2 = trimmed.match(/^\+\+\+\s+b\/(.+)$/);
+    if (m2) return m2[1].trim();
+    const m3 = trimmed.match(/^diff --git a\/(.+?) b\/(.+)$/);
+    if (m3) return m3[2].trim();
+  }
+
   return null;
 }
 
@@ -165,6 +193,13 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
   promptIndex,
   sessionId,
 }) => {
+  const resolvedPromptIndex = useMemo(() => {
+    for (const msg of group.messages) {
+      const idx = (msg as any)?.codexPromptIndex;
+      if (idx !== undefined && idx !== null) return Number(idx);
+    }
+    return promptIndex;
+  }, [group.messages, promptIndex]);
   const [isExpanded, setIsExpanded] = useState<boolean>(isStreaming);
   const [openStepKey, setOpenStepKey] = useState<string | null>(null);
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
@@ -172,6 +207,14 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
   const [detailDisableFetch, setDetailDisableFetch] = useState(false);
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
+  const [promptChangedFiles, setPromptChangedFiles] = useState<ChangedFileEntry[] | null>(null);
+  const [promptChangeIdByFile, setPromptChangeIdByFile] = useState<Record<string, string> | null>(null);
+  const promptKeyRef = useRef<string | null>(null);
+  const promptRetryRef = useRef<{ key: string | null; attempts: number; timer: ReturnType<typeof setTimeout> | null }>({
+    key: null,
+    attempts: 0,
+    timer: null,
+  });
 
   // 流式输出时自动展开，方便实时查看进度
   useEffect(() => {
@@ -323,7 +366,424 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
     };
   }, [toolUseBlocks, getResultById, projectPath]);
 
-  const changedFiles = useMemo((): ChangedFileEntry[] => {
+  const parseTimestampMs = useCallback((raw: string | undefined | null): number | null => {
+    const s = String(raw || '').trim();
+    if (!s) return null;
+
+    // Numeric timestamps (ms or seconds)
+    if (/^\d+$/.test(s)) {
+      const n = Number(s);
+      if (!Number.isFinite(n)) return null;
+      return s.length <= 10 ? n * 1000 : n;
+    }
+
+    const ms = Date.parse(s);
+    return Number.isFinite(ms) ? ms : null;
+  }, []);
+
+  const groupEndMs = useMemo(() => {
+    let latest: number | null = null;
+    for (const msg of group.messages) {
+      const raw = (msg as any)?.receivedAt || (msg as any)?.timestamp;
+      const ms = parseTimestampMs(raw);
+      if (ms === null) continue;
+      if (latest === null || ms > latest) latest = ms;
+    }
+    return latest;
+  }, [group.messages, parseTimestampMs]);
+
+  const normalizeChangePathForCompare = useCallback((value: string): string => {
+    if (!value) return value;
+
+    const norm = value.replace(/\\/g, "/");
+    const base = (projectPath || "").replace(/\\/g, "/").replace(/\/+$/, "");
+
+    const isWindowsBase = /^[A-Z]:/i.test(base);
+    const toHostPath = (p: string): string => {
+      if (!p) return p;
+      const np = p.replace(/\\/g, "/");
+      if (!isWindowsBase) return np;
+      const m = np.match(/^\/mnt\/([a-zA-Z])\/(.*)$/);
+      if (!m) return np;
+      return `${m[1].toUpperCase()}:/${m[2]}`;
+    };
+
+    const fp = toHostPath(norm);
+    const baseHost = toHostPath(base);
+
+    if (baseHost) {
+      const fpLower = fp.toLowerCase();
+      const baseLower = baseHost.toLowerCase();
+      if (fpLower === baseLower) return "";
+      if (fpLower.startsWith(`${baseLower}/`)) {
+        return fp.slice(baseHost.length + 1);
+      }
+    }
+
+    return fp.replace(/^\.\//, "");
+  }, [projectPath]);
+
+  const normalizeChangeKeyForCompare = useCallback((value: string): string => {
+    const v = normalizeChangePathForCompare(value).replace(/^\.\//, "").trim();
+    const isWindows = /^[A-Z]:/i.test(projectPath || "");
+    return isWindows ? v.toLowerCase() : v;
+  }, [normalizeChangePathForCompare, projectPath]);
+
+  const touchedFilePaths = useMemo(() => {
+    const fileToolNames = new Set([
+      'edit',
+      'multiedit',
+      'write',
+      'write_file',
+      'create_file',
+      'delete_file',
+      'remove_file',
+      'apply_patch',
+      'file_change',
+    ]);
+    const touched = new Set<string>();
+
+    toolUseBlocks.forEach((tool) => {
+      const name = (tool.name || '').toLowerCase();
+      if (!fileToolNames.has(name)) return;
+      const fp = extractFilePathFromTool(tool) || tool.input?.file_path || tool.input?.path || tool.input?.file || '';
+      const key = normalizeChangeKeyForCompare(String(fp)).trim();
+      if (key) touched.add(key);
+    });
+
+    return touched;
+  }, [normalizeChangeKeyForCompare, toolUseBlocks]);
+
+  const touchedFileNames = useMemo(() => {
+    const names = new Set<string>();
+    touchedFilePaths.forEach((p) => {
+      const base = getFileName(p).trim();
+      if (!base) return;
+      names.add(normalizeChangeKeyForCompare(base));
+    });
+    return names;
+  }, [normalizeChangeKeyForCompare, touchedFilePaths]);
+
+  // If change-records are written slightly after the UI finishes streaming, the first fetch can be empty.
+  // Listen for backend "codex-change-recorded" and retry loading for this activity group.
+  useEffect(() => {
+    if (!sessionId) return;
+
+    let unlisten: UnlistenFn | null = null;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+    (async () => {
+      try {
+        unlisten = await listen<any>(`codex-change-recorded:${sessionId}`, (evt) => {
+          const payload = (evt as any)?.payload as any;
+          const fp = String(payload?.file_path || '').trim();
+          const rawPromptIdx = payload?.prompt_index;
+          const evtPromptIndex = typeof rawPromptIdx === 'number' ? rawPromptIdx : Number(rawPromptIdx);
+
+          const key = fp ? normalizeChangeKeyForCompare(fp) : '';
+          const baseNameKey = fp ? normalizeChangeKeyForCompare(getFileName(fp)) : '';
+
+          // Only refresh when the event is likely related to this Finished working block.
+          // - Prefer exact file path match (project-relative after normalization)
+          // - Fall back to basename match (some tools only report basename)
+          // - Or prompt-index proximity (handles rare prompt-index drift between clients)
+          const matchByFile =
+            (key && touchedFilePaths.has(key)) ||
+            (baseNameKey && touchedFileNames.has(baseNameKey));
+          const matchByPrompt =
+            resolvedPromptIndex !== undefined &&
+            resolvedPromptIndex !== null &&
+            resolvedPromptIndex >= 0 &&
+            Number.isFinite(evtPromptIndex) &&
+            Math.abs(evtPromptIndex - resolvedPromptIndex) <= 2;
+
+          if (!matchByFile && !matchByPrompt) return;
+
+          if (refreshTimer) clearTimeout(refreshTimer);
+          refreshTimer = setTimeout(() => {
+            setPromptChangedFiles(null);
+            setPromptChangeIdByFile(null);
+          }, 200);
+        });
+      } catch (err) {
+        // Non-Tauri environments (ui-lab) can't listen to backend events; ignore.
+      }
+    })();
+
+    return () => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      if (unlisten) unlisten();
+    };
+  }, [normalizeChangeKeyForCompare, resolvedPromptIndex, sessionId, touchedFileNames, touchedFilePaths]);
+
+  // Prefer change-records (prompt-scoped) for the bottom "files changed" summary.
+  // Some sessions have prompt-index drift between UI and recorded change indices; we pick the
+  // best-matching prompt in a small window by comparing file sets.
+  useEffect(() => {
+    const nextKey = sessionId
+      ? resolvedPromptIndex !== undefined && resolvedPromptIndex >= 0
+        ? `${sessionId}:pi:${resolvedPromptIndex}`
+        : `${sessionId}:g:${group.id}`
+      : null;
+
+    if (promptKeyRef.current !== nextKey) {
+      promptKeyRef.current = nextKey;
+      setPromptChangedFiles(null);
+      setPromptChangeIdByFile(null);
+      if (promptRetryRef.current.timer) {
+        clearTimeout(promptRetryRef.current.timer);
+        promptRetryRef.current.timer = null;
+      }
+      promptRetryRef.current.key = nextKey;
+      promptRetryRef.current.attempts = 0;
+    }
+
+    if (!nextKey) return;
+    if (isStreaming) return;
+    // Already attempted loading for this prompt; avoid re-fetching on unrelated re-renders.
+    if (promptChangedFiles !== null) return;
+
+    let cancelled = false;
+    const sid = sessionId as string;
+    const pi =
+      resolvedPromptIndex !== undefined && resolvedPromptIndex >= 0
+        ? (resolvedPromptIndex as number)
+        : null;
+
+    (async () => {
+      try {
+        const all = await api.codexListFileChanges(sid);
+        if (cancelled) return;
+        const toolTouchedFiles = new Set<string>();
+        const toolUseIds = new Set<string>();
+        const fileToolNames = new Set([
+          'edit',
+          'multiedit',
+          'write',
+          'write_file',
+          'create_file',
+          'delete_file',
+          'remove_file',
+          'apply_patch',
+          'file_change',
+        ]);
+
+        toolUseBlocks.forEach((tool) => {
+          if (tool.id) toolUseIds.add(tool.id);
+          const name = (tool.name || '').toLowerCase();
+          if (!fileToolNames.has(name)) return;
+          const fp = extractFilePathFromTool(tool) || tool.input?.file_path || tool.input?.path || tool.input?.file || '';
+          const key = normalizeChangeKeyForCompare(String(fp)).trim();
+          if (key) toolTouchedFiles.add(key);
+        });
+
+        const groupEndTimestampMs = groupEndMs;
+
+        const changesByPrompt = new Map<number, { changes: CodexFileChange[]; toolCallIds: Set<string> }>();
+        const toolMatchedChanges: CodexFileChange[] = [];
+        all.forEach((change) => {
+          const key = change.prompt_index;
+          const existing = changesByPrompt.get(key);
+          if (existing) {
+            existing.changes.push(change);
+          } else {
+            changesByPrompt.set(key, { changes: [change], toolCallIds: new Set() });
+          }
+
+          const toolCallId = String(change.tool_call_id || '').trim();
+          if (toolCallId) {
+            const bucket = changesByPrompt.get(key);
+            if (bucket) {
+              toolCallId.split(',').forEach((id) => {
+                const tid = id.trim();
+                if (tid) bucket.toolCallIds.add(tid);
+              });
+            }
+
+            // Best match: map changes directly to the current ActivityGroup by tool_use_id.
+            // This avoids any prompt_index drift between different Codex clients (official plugin vs this app).
+            const hasAnyToolUseId = toolCallId
+              .split(',')
+              .map((id) => id.trim())
+              .filter(Boolean)
+              .some((id) => toolUseIds.has(id));
+            if (hasAnyToolUseId) {
+              toolMatchedChanges.push(change);
+            }
+          }
+        });
+
+        const buildEntriesForPrompt = (idx: number) => {
+          const bucket = changesByPrompt.get(idx);
+          const promptChanges = (bucket?.changes || [])
+            .slice()
+            .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+          const latestByFile = new Map<string, { filePath: string; change: CodexFileChange }>();
+          for (const change of promptChanges) {
+            const key = normalizeChangeKeyForCompare(change.file_path).trim();
+            if (!key) continue;
+            const displayPath = normalizeChangePathForCompare(change.file_path).trim() || change.file_path;
+            latestByFile.set(key, { filePath: displayPath, change });
+          }
+
+          const entries = Array.from(latestByFile.values()).map(({ filePath, change }) => ({
+            filePath,
+            added: change.lines_added || 0,
+            removed: change.lines_removed || 0,
+          }));
+
+          const endTs = promptChanges.length > 0 ? promptChanges[promptChanges.length - 1]!.timestamp : '';
+          const endMs = endTs ? parseTimestampMs(endTs) : null;
+
+          return { entries, endMs, toolCallIds: bucket?.toolCallIds || new Set<string>() };
+        };
+
+        // If we can match by tool_call_id, that's the most accurate set for this Finished working block.
+        if (toolMatchedChanges.length > 0) {
+          const latestByFile = new Map<string, { filePath: string; change: CodexFileChange }>();
+          toolMatchedChanges
+            .slice()
+            .sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+            .forEach((change) => {
+              const key = normalizeChangeKeyForCompare(change.file_path).trim();
+              if (!key) return;
+              const displayPath = normalizeChangePathForCompare(change.file_path).trim() || change.file_path;
+              latestByFile.set(key, { filePath: displayPath, change });
+            });
+
+          const idByFile: Record<string, string> = {};
+          const entries = Array.from(latestByFile.values()).map(({ filePath, change }) => {
+            idByFile[normalizeChangeKeyForCompare(change.file_path)] = change.id;
+            return {
+              filePath,
+              added: change.lines_added || 0,
+              removed: change.lines_removed || 0,
+            };
+          });
+
+          if (!cancelled) {
+            setPromptChangeIdByFile(idByFile);
+            setPromptChangedFiles(entries);
+          }
+          return;
+        }
+
+        const candidates = Array.from(changesByPrompt.keys());
+        if (candidates.length === 0) {
+          // If the backend hasn't written change-records yet, retry a few times to avoid
+          // getting stuck on tool-fragment stats (+/- based on old_string/new_string).
+          if (!cancelled) {
+            setPromptChangedFiles([]);
+            const retry = promptRetryRef.current;
+            if (touchedFilePaths.size > 0 && retry.key === nextKey && retry.attempts < 4) {
+              retry.attempts += 1;
+              if (retry.timer) clearTimeout(retry.timer);
+              retry.timer = setTimeout(() => {
+                setPromptChangedFiles(null);
+                setPromptChangeIdByFile(null);
+              }, 250 * retry.attempts);
+            }
+          }
+          return;
+        }
+
+        const computeScore = (entries: ChangedFileEntry[]) => {
+          if (toolTouchedFiles.size === 0) return 0;
+          const entryFiles = new Set(
+            entries.map((e) => normalizeChangeKeyForCompare(e.filePath).trim()).filter(Boolean)
+          );
+          const union = new Set<string>([...toolTouchedFiles, ...entryFiles]);
+          let inter = 0;
+          toolTouchedFiles.forEach((fp) => {
+            if (entryFiles.has(fp)) inter += 1;
+          });
+          return union.size > 0 ? inter / union.size : 0;
+        };
+
+        const computeDist = (endMs: number | null) => {
+          if (groupEndTimestampMs === null || endMs === null) return Number.POSITIVE_INFINITY;
+          return Math.abs(groupEndTimestampMs - endMs);
+        };
+
+        const computeToolCallMatch = (toolCallIds: Set<string>) => {
+          if (toolUseIds.size === 0) return { count: 0, ratio: 0 };
+          let count = 0;
+          toolUseIds.forEach((id) => {
+            if (toolCallIds.has(id)) count += 1;
+          });
+          return { count, ratio: toolUseIds.size > 0 ? count / toolUseIds.size : 0 };
+        };
+
+        // If we have a prompt index from the UI, start from it; otherwise start from the first candidate.
+        const initialIdx = pi !== null ? pi : candidates[0]!;
+        const baseline = buildEntriesForPrompt(initialIdx);
+        const baselineToolMatch = computeToolCallMatch(baseline.toolCallIds);
+        let best = {
+          idx: initialIdx,
+          score: computeScore(baseline.entries),
+          endMs: baseline.endMs,
+          dist: computeDist(baseline.endMs),
+          toolMatch: baselineToolMatch,
+          entries: baseline.entries,
+        };
+
+        candidates.forEach((idx) => {
+          if (idx === initialIdx) return;
+          const { entries, endMs, toolCallIds } = buildEntriesForPrompt(idx);
+          const score = computeScore(entries);
+          const dist = computeDist(endMs);
+          const toolMatch = computeToolCallMatch(toolCallIds);
+
+          const isBetter =
+            toolUseIds.size > 0
+              ? toolMatch.count > best.toolMatch.count ||
+                (toolMatch.count === best.toolMatch.count &&
+                  (score > best.score ||
+                    (score === best.score &&
+                      (dist < best.dist ||
+                        (dist === best.dist &&
+                          Math.abs(idx - initialIdx) < Math.abs(best.idx - initialIdx))))))
+              : toolTouchedFiles.size === 0
+              ? dist < best.dist || (dist === best.dist && Math.abs(idx - initialIdx) < Math.abs(best.idx - initialIdx))
+              : score > best.score ||
+                (score === best.score &&
+                  (dist < best.dist || (dist === best.dist && Math.abs(idx - initialIdx) < Math.abs(best.idx - initialIdx))));
+
+          if (isBetter) {
+            best = { idx, score, endMs, dist, toolMatch, entries };
+          }
+        });
+
+        if (!cancelled) {
+          setPromptChangeIdByFile(null);
+          setPromptChangedFiles(best.entries);
+
+          // If we still didn't get any matched entries but file tools touched files,
+          // it's likely the recorder hasn't flushed yet. Retry briefly.
+          if (best.entries.length === 0 && touchedFilePaths.size > 0) {
+            const retry = promptRetryRef.current;
+            if (retry.key === nextKey && retry.attempts < 4) {
+              retry.attempts += 1;
+              if (retry.timer) clearTimeout(retry.timer);
+              retry.timer = setTimeout(() => {
+                setPromptChangedFiles(null);
+                setPromptChangeIdByFile(null);
+              }, 250 * retry.attempts);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('[ActivityMessageGroup] Failed to load prompt file changes:', err);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, resolvedPromptIndex, isStreaming, projectPath, toolUseBlocks, groupEndMs, parseTimestampMs, promptChangedFiles, touchedFilePaths]);
+
+  const changedFilesFromTools = useMemo((): ChangedFileEntry[] => {
     const acc = new Map<string, { added: number; removed: number }>();
 
     const normalizeFilePath = (value: string): string => {
@@ -366,25 +826,56 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
       acc.set(key, prev);
     };
 
+    const countDiffLines = (text: string): { added: number; removed: number } => {
+      let added = 0;
+      let removed = 0;
+      for (const line of String(text || '').split(/\r?\n/)) {
+        if (line.startsWith('+') && !line.startsWith('+++ ')) {
+          added += 1;
+        } else if (line.startsWith('-') && !line.startsWith('--- ')) {
+          removed += 1;
+        }
+      }
+      return { added, removed };
+    };
+
     toolUseBlocks.forEach((tool) => {
       const name = (tool.name || "").toLowerCase();
       const input = tool.input || {};
       const fp = extractFilePathFromTool(tool) || input.file_path || input.path || '';
       if (!fp) return;
 
+      if (name === "apply_patch" || name === "file_change") {
+        const patchText = String(input.patch || input.diff || input.raw_input || "");
+        if (!patchText.trim()) return;
+
+        const chunks = splitPatchIntoFileChunks(patchText);
+        if (chunks.length > 0) {
+          chunks.forEach((c) => {
+            const stats = countDiffLines(c.patchText);
+            add(c.filePath || fp, stats.added, stats.removed);
+          });
+          return;
+        }
+
+        const stats = countDiffLines(patchText);
+        add(fp, stats.added, stats.removed);
+        return;
+      }
+
       if (name === "edit") {
         const oldStr = String(input.old_string || "");
         const newStr = String(input.new_string || "");
 
         const diffResult = Diff.diffLines(oldStr, newStr, {
-          newlineIsToken: true,
           ignoreWhitespace: false,
         });
 
         const stats = diffResult.reduce(
           (s, part: any) => {
-            if (part.added) s.added += part.count || 0;
-            if (part.removed) s.removed += part.count || 0;
+            const partLines = countLines(String(part?.value || ""));
+            if (part.added) s.added += partLines;
+            if (part.removed) s.removed += partLines;
             return s;
           },
           { added: 0, removed: 0 }
@@ -403,12 +894,12 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
           const oldStr = String(e?.old_string || "");
           const newStr = String(e?.new_string || "");
           const diffResult = Diff.diffLines(oldStr, newStr, {
-            newlineIsToken: true,
             ignoreWhitespace: false,
           });
           diffResult.forEach((part: any) => {
-            if (part.added) added += part.count || 0;
-            if (part.removed) removed += part.count || 0;
+            const partLines = countLines(String(part?.value || ""));
+            if (part.added) added += partLines;
+            if (part.removed) removed += partLines;
           });
         });
 
@@ -429,6 +920,42 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
       removed: s.removed,
     }));
   }, [toolUseBlocks, projectPath]);
+
+  const changedFiles = useMemo(() => {
+    if (promptChangedFiles && promptChangedFiles.length > 0) {
+      if (changedFilesFromTools.length === 0) return promptChangedFiles;
+
+      const toolByKey = new Map<string, ChangedFileEntry>();
+      changedFilesFromTools.forEach((e) => {
+        const k = normalizeChangeKeyForCompare(e.filePath);
+        if (!k) return;
+        toolByKey.set(k, e);
+      });
+
+      const merged = promptChangedFiles.map((e) => {
+        const k = normalizeChangeKeyForCompare(e.filePath);
+        const tool = toolByKey.get(k);
+        if (!tool) return e;
+
+        const backendTotal = (e.added || 0) + (e.removed || 0);
+        const toolTotal = (tool.added || 0) + (tool.removed || 0);
+        const shouldPreferTool = toolTotal > 0 && (backendTotal === 0 || backendTotal > toolTotal * 3);
+        return shouldPreferTool ? { ...e, added: tool.added, removed: tool.removed } : e;
+      });
+
+      // If backend missed some tool-changed files, append them.
+      const seen = new Set(merged.map((e) => normalizeChangeKeyForCompare(e.filePath)).filter(Boolean));
+      changedFilesFromTools.forEach((e) => {
+        const k = normalizeChangeKeyForCompare(e.filePath);
+        if (!k || seen.has(k)) return;
+        merged.push(e);
+      });
+
+      return merged;
+    }
+
+    return changedFilesFromTools;
+  }, [changedFilesFromTools, normalizeChangeKeyForCompare, promptChangedFiles]);
 
   const normalizeForCompare = useCallback((value: string): string => {
     if (!value) return value;
@@ -477,30 +1004,21 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
         return;
       }
 
-      // 1) Best effort: use the tool-level old/new strings from this activity group.
-      // This is the most accurate "IDEA-like" full-context before/after for the current Finished working block.
-      const local = findLocalToolDiff(filePath);
-      if (local) {
-        const now = new Date().toISOString();
-        setInitialChange({
-          id: `local:${group.id}:${normalizeForCompare(local.filePath)}:${now}`,
-          session_id: sessionId,
-          prompt_index: promptIndex ?? -1,
-          timestamp: now,
-          file_path: local.filePath,
-          change_type: "update",
-          source: "tool",
-          old_content: local.oldText,
-          new_content: local.newText,
-        });
-        setSelectedChangeId(`local:${group.id}:${normalizeForCompare(local.filePath)}:${now}`);
-        setDetailDisableFetch(true);
+      // 1) If we matched change-records by tool_call_id for this activity group,
+      // use that id directly (avoids prompt-index drift).
+      const wantedNorm = normalizeForCompare(filePath);
+      const directId = wantedNorm ? promptChangeIdByFile?.[wantedNorm] : undefined;
+      if (directId) {
+        setSelectedChangeId(directId);
+        setInitialChange(null);
+        setDetailDisableFetch(false);
         setDiffError(null);
         return;
       }
 
+      // 2) Try to find the best matching backend record (net diff per file per prompt).
       setDetailDisableFetch(false);
-      if (promptIndex === undefined || promptIndex < 0) {
+      if (resolvedPromptIndex === undefined || resolvedPromptIndex < 0) {
         // Still allow fallback search across the whole session
         console.warn("[ChangedFilesSummary] Missing promptIndex, will fallback to session-wide search");
       }
@@ -513,8 +1031,8 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
         const wantedName = getFileName(wanted);
 
         const promptChanges =
-          promptIndex !== undefined && promptIndex >= 0
-            ? changes.filter((c) => c.prompt_index === promptIndex)
+          resolvedPromptIndex !== undefined && resolvedPromptIndex >= 0
+            ? changes.filter((c) => c.prompt_index === resolvedPromptIndex)
             : changes;
 
         let candidates = promptChanges.filter((c) => matchesFile(c.file_path, wanted));
@@ -531,7 +1049,7 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
         }
 
         // If still not found in current prompt, fallback to session-wide search (latest wins)
-        if (candidates.length === 0 && promptIndex !== undefined && promptIndex >= 0) {
+        if (candidates.length === 0 && resolvedPromptIndex !== undefined && resolvedPromptIndex >= 0) {
           const allByPath = changes.filter((c) => matchesFile(c.file_path, wanted));
           let fallback: typeof allByPath = allByPath;
           if (fallback.length === 0 && wantedName) {
@@ -547,6 +1065,27 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
           candidates.slice().sort((a, b) => a.timestamp.localeCompare(b.timestamp)).at(-1) || null;
 
         if (!picked) {
+          // 3) Last resort: use the tool-level old/new strings from this activity group (may be a fragment).
+          const local = findLocalToolDiff(filePath);
+          if (local) {
+            const now = new Date().toISOString();
+            setInitialChange({
+              id: `local:${group.id}:${normalizeForCompare(local.filePath)}:${now}`,
+              session_id: sessionId,
+              prompt_index: resolvedPromptIndex ?? -1,
+              timestamp: now,
+              file_path: local.filePath,
+              change_type: "update",
+              source: "tool",
+              old_content: local.oldText,
+              new_content: local.newText,
+            });
+            setSelectedChangeId(`local:${group.id}:${normalizeForCompare(local.filePath)}:${now}`);
+            setDetailDisableFetch(true);
+            setDiffError("未找到该文件的变更记录，已使用 tool diff（可能缺少完整上下文）");
+            return;
+          }
+
           setDiffError("未找到该文件的变更记录（可能尚未写入变更追踪）");
           return;
         }
@@ -559,7 +1098,7 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
         setDiffLoading(false);
       }
     },
-    [findLocalToolDiff, group.id, matchesFile, normalizeForCompare, promptIndex, sessionId]
+    [findLocalToolDiff, group.id, matchesFile, normalizeForCompare, promptChangeIdByFile, resolvedPromptIndex, sessionId]
   );
 
   const summaryTitle = useMemo(() => {
@@ -577,11 +1116,13 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
 
     const hasWritesOrEdits = editCount + writeCount > 0;
     if (hasWritesOrEdits) {
-      return `修改了 ${Math.max(1, touchedCount)} 个文件`;
+      const changedCount = changedFiles.length;
+      // Prefer the actual changed-file list (like the official plugin). Fallback to "touched" for legacy sessions.
+      return `修改了 ${Math.max(1, changedCount > 0 ? changedCount : touchedCount)} 个文件`;
     }
 
     return "工作过程";
-  }, [fileSummary, stats.total, toolUseBlocks]);
+  }, [fileSummary, stats.total, toolUseBlocks, changedFiles.length]);
 
   const headerTitle = isStreaming || stats.pending > 0 ? "Working…" : "Finished working";
   const headerText = summaryTitle && summaryTitle !== "工作过程" ? `${headerTitle} • ${summaryTitle}` : headerTitle;
@@ -600,10 +1141,10 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
           {stats.total}
         </span>
       )}
-      {fileSummary.touchedCount > 0 && (
+      {(changedFiles.length > 0 || fileSummary.touchedCount > 0) && (
         <span className="inline-flex items-center gap-1 rounded bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground">
           <FileText className="h-3 w-3 opacity-70" />
-          {fileSummary.touchedCount}
+          {changedFiles.length > 0 ? changedFiles.length : fileSummary.touchedCount}
         </span>
       )}
       {group.messages.some((m) => m.type === "thinking") && (
@@ -616,7 +1157,9 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
   );
 
   const fileChips = useMemo(() => {
-    const files = fileSummary.uniqueFiles;
+    // Prefer changed files for chips (match official plugin). Fall back to touched files if needed.
+    const files = (changedFiles.length > 0 ? changedFiles.map((c) => c.filePath) : fileSummary.uniqueFiles)
+      .filter(Boolean);
     if (files.length === 0) return null;
 
     const maxChips = 3;

@@ -33,6 +33,45 @@ const debug = (...args: any[]) => {
   if (DEBUG_CODEX_CONVERTER) console.log(...args);
 };
 
+const coerceToString = (value: unknown): string => {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+  if (Array.isArray(value)) {
+    return value.map(coerceToString).filter((s) => s.trim().length > 0).join('\n');
+  }
+  if (typeof value === 'object') {
+    const v: any = value;
+    if (typeof v.text === 'string') return v.text;
+    if (typeof v.message === 'string') return v.message;
+    if (typeof v.content === 'string') return v.content;
+    if (typeof v.summary_text === 'string') return v.summary_text;
+    if (typeof v.value === 'string') return v.value;
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return '';
+    }
+  }
+  return '';
+};
+
+const pickFirstNonEmptyText = (...candidates: unknown[]): string => {
+  for (const candidate of candidates) {
+    const text = coerceToString(candidate);
+    if (text.trim().length > 0) return text;
+  }
+  return '';
+};
+
+const extractUserRequestFromIdeContext = (value: string): string | null => {
+  const marker = '## My request for Codex:';
+  const idx = value.indexOf(marker);
+  if (idx < 0) return null;
+  const extracted = value.slice(idx + marker.length).trim();
+  return extracted.length > 0 ? extracted : null;
+};
+
 /**
  * Maps Codex tool names to Claude Code tool names
  * This ensures consistent tool rendering between realtime stream and history loading
@@ -97,12 +136,23 @@ function stripImagePlaceholders(text: string): string {
  * State manager for Codex event conversion
  * Maintains context across multiple events for proper message construction
  */
+export interface CodexEventConverterOptions {
+  /**
+   * Whether to surface event_msg.agent_reasoning as visible thinking blocks.
+   * - Keep `false` (default) for history loading to avoid duplicate noise.
+   * - Enable for realtime file-watcher streams to match VSCode plugin behavior.
+   */
+  includeAgentReasoning?: boolean;
+}
+
 export class CodexEventConverter {
+  private options: CodexEventConverterOptions;
   private threadId: string | null = null;
   private currentTurnUsage: { input_tokens: number; cached_input_tokens?: number; output_tokens: number } | null = null;
   private itemMap: Map<string, CodexItem> = new Map();
   /** Stores tool results by call_id for later matching with tool_use */
   private toolResults: Map<string, { content: string; is_error: boolean }> = new Map();
+  private agentReasoningSegments: Set<string> = new Set();
 
   // ✅ FIX: Add cumulative token tracking for real-time context window updates
   /** Cumulative token usage across all turns in the session */
@@ -111,6 +161,10 @@ export class CodexEventConverter {
     cached_input_tokens: 0,
     output_tokens: 0,
   };
+
+  constructor(options: CodexEventConverterOptions = {}) {
+    this.options = options;
+  }
 
   /**
    * Gets stored tool result by call_id
@@ -261,12 +315,28 @@ export class CodexEventConverter {
 
     switch (payload.type) {
       case 'agent_reasoning':
-        // Skip agent_reasoning - it's duplicated by response_item.reasoning
-        // Codex sends both event_msg.agent_reasoning (quick notification) and
-        // response_item.reasoning (full details with encrypted content)
-        // We only process response_item.reasoning to avoid duplicates
-        debug('[CodexConverter] Skipping event_msg.agent_reasoning (handled by response_item.reasoning)');
-        return null;
+        // Realtime-friendly thinking updates (VSCode plugin shows these while the model is working).
+        // We keep it OFF by default to avoid duplicating response_item.reasoning when loading history.
+        if (!this.options.includeAgentReasoning) {
+          debug('[CodexConverter] Skipping event_msg.agent_reasoning (handled by response_item.reasoning)');
+          return null;
+        }
+        {
+          const raw = pickFirstNonEmptyText((payload as any).text, (payload as any).message, (payload as any).content);
+          const text = raw.trim();
+          if (!text) return null;
+
+          this.agentReasoningSegments.add(text);
+
+          return {
+            type: 'thinking',
+            content: raw,
+            timestamp: event.timestamp || new Date().toISOString(),
+            receivedAt: event.timestamp || new Date().toISOString(),
+            engine: 'codex' as const,
+            _codexAgentReasoning: true,
+          } as ClaudeStreamMessage;
+        }
 
       case 'token_count':
         // Extract token usage from event_msg with type="token_count"
@@ -313,6 +383,28 @@ export class CodexEventConverter {
         debug('[CodexConverter] ⚠️ Skipping event_msg.user_message (duplicates response_item with role=user)');
         return null;
 
+      case 'agent_message':
+      case 'assistant_message': {
+        // Codex may emit assistant text as event_msg.agent_message (sometimes without a matching
+        // response_item message). We convert it so the UI can display the output.
+        //
+        // When response_item is also present, we de-dupe in useDisplayableMessages via
+        // the `_codexAgentMessage` marker.
+        const text = pickFirstNonEmptyText((payload as any).message, (payload as any).text, (payload as any).content);
+        if (!text.trim()) return null;
+        return {
+          type: 'assistant',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text }],
+          },
+          timestamp: event.timestamp || new Date().toISOString(),
+          receivedAt: event.timestamp || new Date().toISOString(),
+          engine: 'codex' as const,
+          _codexAgentMessage: true,
+        } as ClaudeStreamMessage;
+      }
+
       default:
         debug('[CodexConverter] Skipping event_msg with payload.type:', payload.type);
         return null;
@@ -332,6 +424,11 @@ export class CodexEventConverter {
 
     // Handle different response_item payload types
     const payloadType = (payload as any).type;
+
+    // A new user message indicates a new turn; reset per-turn agent_reasoning tracking.
+    if (payloadType === 'message' && payload.role === 'user') {
+      this.agentReasoningSegments.clear();
+    }
 
     if (payloadType === 'function_call') {
       // Tool use (function call)
@@ -377,18 +474,29 @@ export class CodexEventConverter {
       ? [{ type: payload.role === 'user' ? 'input_text' : 'output_text', text: (payload as any).content }]
       : [];
 
-    // Filter out system environment context messages from user
+    // VSCode Codex plugin usually wraps the real request inside an IDE-context blob.
+    // Keep the actual "My request for Codex" part and drop the injected context (without losing images).
+    let coercedUserRequest: string | null = null;
+    let suppressInjectedUserText = false;
     if (payload.role === 'user' && rawContentArray.length > 0) {
-      const isEnvContext = rawContentArray.some((c: any) =>
-        c?.type === 'input_text' && typeof c?.text === 'string' && (
-          c.text.includes('<environment_context>') ||
-          c.text.includes('# AGENTS.md instructions')
-        )
-      );
+      const combinedUserText = rawContentArray
+        .filter((c: any) => c?.type === 'input_text')
+        .map((c: any) => coerceToString(c?.text))
+        .filter((s: string) => s.trim().length > 0)
+        .join('\n');
 
-      if (isEnvContext) {
-        debug('[CodexConverter] Filtered out environment context message');
-        return null;
+      coercedUserRequest = extractUserRequestFromIdeContext(combinedUserText);
+
+      const lower = combinedUserText.toLowerCase();
+      const hasInjectedContext =
+        lower.includes('<environment_context>') ||
+        lower.includes('# agents.md instructions') ||
+        lower.includes('<permissions instructions>') ||
+        lower.includes('<turn_aborted');
+
+      // If it looks like injected context but we can't extract a real request, drop text blocks.
+      if (hasInjectedContext && !coercedUserRequest) {
+        suppressInjectedUserText = true;
       }
     }
 
@@ -398,11 +506,30 @@ export class CodexEventConverter {
     // Codex uses 'input_image' with 'image_url' for images
     // Claude uses 'image' with 'source' for images
     const hasImageBlock = rawContentArray.some((c: any) => c?.type === 'input_image');
+    let didApplyUserRequest = false;
 
 	    const content = rawContentArray.map((c: any) => {
 	      // Handle text content
-	      if (c.type === 'input_text' || c.type === 'output_text') {
-	        const rawText = c.text || '';
+	      if (c.type === 'input_text' || c.type === 'output_text' || c.type === 'output_text_delta' || c.type === 'text') {
+	        const rawTextValue = c.text ?? c.delta ?? c.message ?? c.content ?? '';
+
+	        // For IDE-context user messages, surface only the actual request (once).
+	        if (payload.role === 'user' && c.type === 'input_text') {
+	          if (coercedUserRequest) {
+	            if (didApplyUserRequest) return null;
+	            didApplyUserRequest = true;
+	            const reqText = /<\/?image>/i.test(coercedUserRequest) || hasImageBlock
+	              ? stripImagePlaceholders(coercedUserRequest)
+	              : coercedUserRequest;
+	            if (!reqText.trim()) return null;
+	            return { type: 'text', text: reqText };
+	          }
+	          if (suppressInjectedUserText) {
+	            return null;
+	          }
+	        }
+
+	        const rawText = coerceToString(rawTextValue);
 	        const text = /<\/?image>/i.test(rawText) || hasImageBlock ? stripImagePlaceholders(rawText) : rawText;
 	        if (!text || !text.trim()) return null;
 	        return { ...c, type: 'text', text };
@@ -501,7 +628,13 @@ export class CodexEventConverter {
     const rawToolName = payload.name || 'unknown_tool';
     // Map Codex tool names to Claude Code equivalents for consistent rendering
     const toolName = mapCodexToolName(rawToolName);
-    const toolArgs = payload.arguments ? JSON.parse(payload.arguments) : {};
+    let toolArgs: any = {};
+    try {
+      toolArgs = payload.arguments ? JSON.parse(payload.arguments) : {};
+    } catch (err) {
+      console.warn('[CodexConverter] Failed to parse tool arguments:', err, payload.arguments);
+      toolArgs = {};
+    }
     const callId = payload.call_id || `call_${Date.now()}`;
 
     // For shell_command, also normalize the input structure
@@ -599,7 +732,7 @@ export class CodexEventConverter {
 
     if (rawToolName === 'apply_patch' && typeof input === 'string') {
       // Extract file path from patch format: "*** Update File: path/to/file"
-      const fileMatch = input.match(/\*\*\* (?:Update|Create|Delete) File: (.+)/);
+      const fileMatch = input.match(/\*\*\* (?:Update|Create|Delete|Add) File: (.+)/);
       const filePath = fileMatch ? fileMatch[1].trim() : '';
 
       // Extract the patch content (everything between @@ markers)
@@ -707,14 +840,43 @@ export class CodexEventConverter {
   /**
    * Converts reasoning response_item to thinking message
    */
-  private convertReasoningPayload(event: any): ClaudeStreamMessage {
+  private convertReasoningPayload(event: any): ClaudeStreamMessage | null {
     const payload = event.payload;
 
     // Extract summary text if available
-    const summaryText = payload.summary
-      ?.map((s: any) => s.text || s.summary_text)
-      .filter(Boolean)
-      .join('\n') || '';
+    const rawSummary = (payload as any)?.summary;
+    const summaryArray: any[] =
+      Array.isArray(rawSummary) ? rawSummary : (typeof rawSummary === 'string' ? [{ text: rawSummary }] : []);
+
+    const summarySegments: string[] = summaryArray
+      .map((s: any) =>
+        pickFirstNonEmptyText(
+          s?.text,
+          s?.summary_text,
+          s?.content,
+          s?.message,
+          s?.value
+        )
+      )
+      .map((s: string) => s.trim())
+      .filter((s: string) => s.length > 0);
+
+    // If we already streamed each segment via event_msg.agent_reasoning, skip the aggregated reasoning payload
+    // to avoid duplicates in realtime mode.
+    if (this.options.includeAgentReasoning && summarySegments.length > 0) {
+      const allSeen = summarySegments.every((s) => this.agentReasoningSegments.has(s));
+      if (allSeen) {
+        return null;
+      }
+    }
+
+    const summaryText = summarySegments.join('\n') || '';
+
+    // In realtime mode, if we have no readable summary, skip the noisy placeholder
+    // (VSCode plugin typically shows agent_reasoning/tool progress instead).
+    if (this.options.includeAgentReasoning && !summaryText.trim()) {
+      return null;
+    }
 
     // Note: encrypted_content is encrypted and cannot be displayed
     // We use the summary instead
@@ -1217,6 +1379,7 @@ export class CodexEventConverter {
     this.currentTurnUsage = null;
     this.itemMap.clear();
     this.toolResults.clear(); // Also clear tool results
+    this.agentReasoningSegments.clear();
 
     // ✅ FIX: Reset cumulative token usage when starting a new session
     this.cumulativeUsage = {

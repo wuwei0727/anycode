@@ -140,6 +140,9 @@ const stripInjectedBlocks = (text: string): string => {
   // Permission instructions wrapper
   result = result.replace(/<permissions instructions>[\s\S]*?<\/permissions instructions>/gi, '');
 
+  // Internal "turn aborted" markers (from interrupted streaming)
+  result = result.replace(/<turn_aborted[^>]*>[\s\S]*?<\/turn_aborted>/gi, '');
+
   // Normalize whitespace (preserve newlines)
   result = result
     .replace(/[^\S\n]+/g, ' ')

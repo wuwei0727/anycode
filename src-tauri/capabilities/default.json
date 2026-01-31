@@ -38,6 +38,7 @@
     "dialog:allow-confirm",
     "shell:default",
     "shell:allow-open",
+    "updater:default",
     "fs:allow-write-text-file",
     "fs:allow-read-text-file",
     "process:allow-restart",
