@@ -179,7 +179,7 @@ export function useDisplayableMessages(
   return useMemo(() => {
     // Codex may emit assistant output as event_msg.agent_message (fallback) AND as response_item.message.
     // We prefer response_item when available and drop the agent_message duplicate.
-    const codexAssistantResponseKeys = new Set<string>();
+    const codexAssistantResponseTexts = new Set<string>();
     for (const msg of messages) {
       if (msg.engine !== 'codex') continue;
       if (msg.type !== 'assistant') continue;
@@ -187,9 +187,12 @@ export function useDisplayableMessages(
 
       const text = extractMessageText(msg).trim();
       if (!text) continue;
-      const ts = (msg.timestamp || msg.receivedAt || '').toString();
-      codexAssistantResponseKeys.add(`${ts}|${text}`);
+      codexAssistantResponseTexts.add(text);
     }
+
+    // Extra safety: dedupe identical Codex assistant messages that may arrive twice
+    // (e.g. global + session-specific channels).
+    const seenCodexAssistantContentKeys = new Set<string>();
 
     // 如果需要隐藏 Warmup，先找到所有 Warmup 消息的索引
     const warmupIndices = new Set<number>();
@@ -213,14 +216,25 @@ export function useDisplayableMessages(
 
     const filtered = messages.filter((message, index) => {
       // De-dupe Codex agent_message fallback when response_item exists for the same (timestamp, text).
-      if (message.engine === 'codex' && message.type === 'assistant' && (message as any)._codexAgentMessage) {
+      if (message.engine === 'codex' && message.type === 'assistant') {
         const text = extractMessageText(message).trim();
         if (text) {
-          const ts = (message.timestamp || message.receivedAt || '').toString();
-          const key = `${ts}|${text}`;
-          if (codexAssistantResponseKeys.has(key)) {
+          // Prefer response_item.message over agent_message, regardless of timestamp drift.
+          if ((message as any)._codexAgentMessage && codexAssistantResponseTexts.has(text)) {
             return false;
           }
+
+          const metaId = message.codexMetadata?.codexItemId;
+          const metaType = message.codexMetadata?.codexItemType;
+          const base =
+            metaId && metaType
+              ? `meta:${metaType}:${metaId}`
+              : `ts:${(message.timestamp || message.receivedAt || '').toString()}`;
+          const key = `${base}|${text}`;
+          if (seenCodexAssistantContentKeys.has(key)) {
+            return false;
+          }
+          seenCodexAssistantContentKeys.add(key);
         }
       }
 

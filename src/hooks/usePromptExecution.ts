@@ -20,7 +20,7 @@ import type { ClaudeStreamMessage } from '@/types/claude';
 import type { ModelType } from '@/components/FloatingPromptInput/types';
 // 🔧 FIX: 导入 CodexEventConverter 类，在每个会话中创建独立实例避免全局单例污染
 import { CodexEventConverter } from '@/lib/codexConverter';
-import { extractFilePathFromPatchText, extractOldNewFromPatchText, splitPatchIntoFileChunks } from '@/lib/codexDiff';
+import { extractFilePathFromPatchText, extractOldNewFromPatchText, splitPatchIntoFileChunks, tryApplyPatchToText } from '@/lib/codexDiff';
 import type { CodexExecutionMode } from '@/types/codex';
 
 // ============================================================================
@@ -442,7 +442,28 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
                   const diskNewContent = resolvedChangeType === 'delete' ? null : await safeReadFile(entry.filePath);
                   const newContent =
                     (diskNewContent ?? entry.toolNewContent ?? entry.fallbackNewContent) || '';
-                  const oldContentToSend = resolvedChangeType === 'create' ? null : (oldContent ?? '');
+                  let oldContentToSend = resolvedChangeType === 'create' ? null : (oldContent ?? '');
+
+                  // If old snapshot was captured too late (common for fast apply_patch), old may equal new.
+                  // In that case, try to reconstruct the real "before" by reverse-applying the patch onto new.
+                  if (
+                    resolvedChangeType === 'update' &&
+                    typeof oldContentToSend === 'string' &&
+                    typeof entry.diffHint === 'string' &&
+                    entry.diffHint.trim().length > 0 &&
+                    typeof newContent === 'string' &&
+                    newContent.length > 0 &&
+                    (oldContentToSend.trim().length === 0 || oldContentToSend === newContent)
+                  ) {
+                    const reconstructedOld = tryApplyPatchToText(newContent, entry.diffHint, 'reverse');
+                    if (reconstructedOld !== null && reconstructedOld !== newContent) {
+                      oldContentToSend = reconstructedOld;
+                    } else if (oldContentToSend === newContent) {
+                      // If we can't reconstruct, prefer letting the backend fall back to patch-based stats
+                      // instead of recording a misleading "0 lines changed".
+                      oldContentToSend = '';
+                    }
+                  }
 
                   const changeId = await api.codexRecordFileChange(
                     codexThreadId,
@@ -478,16 +499,49 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
             Array.from(trackedCodexFileTools.keys()).forEach((id) => finalizeToolChange(id));
           };
 
-          // Helper function to generate message ID for deduplication
+          // Helper function to generate a stable ID for deduplication.
+          // Global + session-specific channels may deliver the same event with slightly different serialization,
+          // so prefer fields from parsed JSON over raw string hashing.
           const getCodexMessageId = (payload: string): string => {
-            // Use payload hash as ID since Codex doesn't provide unique message IDs
-            let hash = 0;
-            for (let i = 0; i < payload.length; i++) {
-              const char = payload.charCodeAt(i);
-              hash = ((hash << 5) - hash) + char;
-              hash = hash & hash;
+            try {
+              const data: unknown = JSON.parse(payload);
+              if (!data || typeof data !== 'object') return payload;
+              const evt = data as Record<string, unknown>;
+
+              const type = typeof evt.type === 'string' ? evt.type : '';
+              const threadId = typeof evt.thread_id === 'string' ? evt.thread_id : '';
+              const timestamp = typeof evt.timestamp === 'string' ? evt.timestamp : '';
+
+              let payloadId = '';
+              const inner = evt.payload;
+              if (inner && typeof inner === 'object') {
+                const p = inner as Record<string, unknown>;
+                if (typeof p.id === 'string') payloadId = p.id;
+                else if (typeof p.item_id === 'string') payloadId = p.item_id;
+                else if (typeof p.call_id === 'string') payloadId = p.call_id;
+              }
+
+              const parts = [type, threadId, payloadId, timestamp].filter((v) => String(v).length > 0);
+              if (parts.length > 0) return `codex:${parts.join('|')}`;
+
+              // As a last resort, hash the raw payload to avoid storing huge strings in memory.
+              let hash = 0;
+              for (let i = 0; i < payload.length; i++) {
+                const char = payload.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash = hash & hash;
+              }
+              return `codex-raw-${hash}`;
+            } catch {
+              // Fallback: deterministic hash of the raw payload
+              let hash = 0;
+              for (let i = 0; i < payload.length; i++) {
+                const char = payload.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash = hash & hash;
+              }
+              return `codex-raw-${hash}`;
             }
-            return `codex-${hash}`;
           };
 
           const extractCodexThreadId = (payload: string): string | null => {
@@ -888,21 +942,17 @@ export function usePromptExecution(config: UsePromptExecutionConfig): UsePromptE
           const codexOutputUnlisten = await listen<string>('codex-output', (evt) => {
             if (!hasActiveSessionRef.current) return;
 
+            // Once we have a session-specific channel, ignore the global fallback entirely to avoid duplicates.
+            if (currentCodexSessionId) {
+              return;
+            }
+
             const payloadThreadId = extractCodexThreadId(evt.payload);
             if (!currentCodexThreadId && payloadThreadId) {
               currentCodexThreadId = payloadThreadId;
             }
 
-            if (currentCodexSessionId) {
-              if (!payloadThreadId) {
-                console.log('[usePromptExecution] Ignoring global codex-output (session-specific listener active)');
-                return;
-              }
-              if (currentCodexThreadId && payloadThreadId !== currentCodexThreadId) {
-                console.log('[usePromptExecution] Ignoring global codex-output (thread mismatch)');
-                return;
-              }
-            } else if (currentCodexThreadId && payloadThreadId && payloadThreadId !== currentCodexThreadId) {
+            if (currentCodexThreadId && payloadThreadId && payloadThreadId !== currentCodexThreadId) {
               console.log('[usePromptExecution] Ignoring global codex-output (thread mismatch)');
               return;
             }

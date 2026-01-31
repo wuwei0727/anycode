@@ -1983,6 +1983,20 @@ export const api = {
   },
 
   /**
+   * Repair/upgrade change records for a session (recompute diffs, backfill old/new when possible)
+   * @param sessionId - The Codex session ID
+   * @returns Promise resolving to whether any records were upgraded
+   */
+  async codexRepairChangeRecords(sessionId: string): Promise<boolean> {
+    try {
+      return await invoke<boolean>("codex_repair_change_records", { sessionId });
+    } catch (error) {
+      console.error("Failed to repair Codex change records:", error);
+      throw error;
+    }
+  },
+
+  /**
    * Get the stored Claude binary path from settings
    * @returns Promise resolving to the path if set, null otherwise
    */

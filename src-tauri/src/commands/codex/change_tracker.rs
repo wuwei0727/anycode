@@ -405,7 +405,22 @@ fn get_commit_after_for_prompt(session_id: &str, prompt_index: i32) -> Option<St
     let records = load_codex_git_records(session_id).ok()?;
     let idx = prompt_index as usize;
     let rec = records.records.iter().find(|r| r.prompt_index == idx)?;
-    rec.commit_after.clone()
+    if let Some(after) = rec.commit_after.clone() {
+        if !after.trim().is_empty() {
+            return Some(after);
+        }
+    }
+
+    // Fallback: if commit_after is missing (e.g. prompt was interrupted), use the next prompt's
+    // commit_before as an approximation of "after". This is usually much closer than reading the
+    // current working tree for historical diffs.
+    let next_idx = idx.saturating_add(1);
+    let next = records.records.iter().find(|r| r.prompt_index == next_idx)?;
+    if next.commit_before.trim().is_empty() {
+        None
+    } else {
+        Some(next.commit_before.clone())
+    }
 }
 
 /// 初始化会话的变更追踪
@@ -523,7 +538,6 @@ pub fn record_file_change(
             let t = s.trim().to_string();
             if t.is_empty() { None } else { Some(t) }
         });
-    let has_tool_diff_hint = diff_hint.is_some();
     let tool_patch_diff = if source == ChangeSource::Tool && change_type == ChangeType::Update {
         if let Some(hint) = diff_hint.clone() {
             Some(hint)
@@ -560,11 +574,15 @@ pub fn record_file_change(
     };
     let final_new = new_from_disk.or(normalized_new);
 
+    // Prefer tool patch hints only when we *don't* trust the full-context snapshot.
+    //
+    // NOTE: `diff_hint` being present is common for apply_patch and should NOT force us to use
+    // patch-based +/- counting, otherwise multiple edits within one prompt become cumulative and
+    // diverge from "net diff" semantics (official plugin behavior).
     let prefer_tool_patch = source == ChangeSource::Tool
         && change_type == ChangeType::Update
         && tool_patch_available
-        // Prefer patch hints only when we don't trust the snapshot (fragment / missing before).
-        && (has_tool_diff_hint || old_is_fragment || normalized_old_missing || final_new.is_none());
+        && (old_is_fragment || normalized_old_missing || final_new.is_none());
 
     // For tool changes, the frontend already decides create/update/delete based on tool metadata.
     // Avoid auto-reclassifying updates to "create" when we failed to snapshot old_content.
@@ -1142,14 +1160,29 @@ pub fn detect_changes_after_command(
         };
 
         // If we didn't snapshot this file before the command (common when the repo was clean),
-        // try to read the tracked version from git so we don't mark it as "create".
-        if old_content.is_none() && new_content.is_some() {
-            if let Some(head) = git_show_file(project_path, "HEAD", file) {
-                old_content = Some(head);
+        // try to read the tracked version from git so we don't mis-classify.
+        if old_content.is_none() {
+            if new_content.is_some() {
+                // Update vs create
+                if let Some(head) = git_show_file(project_path, "HEAD", file) {
+                    old_content = Some(head);
+                }
+            } else {
+                // Delete: file missing after command but might exist in HEAD
+                if let Some(head) = git_show_file(project_path, "HEAD", file) {
+                    old_content = Some(head);
+                }
             }
         }
 
-        // 确定变更类型
+        // No net change (very common when running read-only commands in a dirty repo).
+        if let (Some(old), Some(new)) = (&old_content, &new_content) {
+            if old == new {
+                continue;
+            }
+        }
+
+        // 确定变更类型（based on net before/after)
         let change_type = match (&old_content, &new_content) {
             (None, Some(_)) => ChangeType::Create,
             (Some(_), None) => ChangeType::Delete,
@@ -1428,15 +1461,43 @@ fn count_diff_lines(diff: &str) -> (i32, i32) {
     let mut added = 0;
     let mut removed = 0;
 
-    for line in diff.lines() {
+    // NOTE: git diff may represent "no newline at end of file" as a replace of the last line:
+    //   -<line>
+    //   \ No newline at end of file
+    //   +<line>
+    // That shouldn't affect change stats for our UX (official plugin usually reports pure insertions).
+    let lines: Vec<&str> = diff.lines().collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+
+        let is_added = line.starts_with('+') && !line.starts_with("+++ ");
+        let is_removed = line.starts_with('-') && !line.starts_with("--- ");
+
+        // Ignore the special no-newline replacement pair when the content is identical.
+        if is_removed
+            && i + 2 < lines.len()
+            && lines[i + 1] == r"\ No newline at end of file"
+            && (lines[i + 2].starts_with('+') && !lines[i + 2].starts_with("+++ "))
+        {
+            let removed_text = &line[1..];
+            let added_text = &lines[i + 2][1..];
+            if removed_text == added_text {
+                i += 3;
+                continue;
+            }
+        }
+
         // Only ignore the unified diff file headers ("+++ b/file", "--- a/file").
         // Do NOT blanket-ignore lines starting with "+++" / "---" because real file
         // content can start with those characters inside hunks.
-        if line.starts_with('+') && !line.starts_with("+++ ") {
+        if is_added {
             added += 1;
-        } else if line.starts_with('-') && !line.starts_with("--- ") {
+        } else if is_removed {
             removed += 1;
         }
+
+        i += 1;
     }
 
     (added, removed)
@@ -1723,4 +1784,45 @@ pub async fn codex_clear_change_records(session_id: String) -> Result<(), String
 
     log::info!("[ChangeTracker] 清理会话变更记录: {}", session_id);
     Ok(())
+}
+
+/// 修复/升级会话的变更记录（重新计算 diff、补齐 old/new 内容等）
+///
+/// 用于：
+/// - App 热更新/版本升级后，历史记录仍是旧格式或统计不一致
+/// - 记录在内存中已加载，但升级逻辑只在从文件读取时触发
+#[tauri::command]
+pub async fn codex_repair_change_records(session_id: String) -> Result<bool, String> {
+    let path = get_change_records_path(&session_id)?;
+
+    // Load from memory first, then fall back to disk.
+    let mut records: Option<CodexChangeRecords> = {
+        let trackers = CHANGE_TRACKERS.lock().unwrap();
+        trackers.get(&session_id).cloned()
+    };
+
+    if records.is_none() && path.exists() {
+        let content = fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {}", e))?;
+        let parsed: CodexChangeRecords =
+            serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {}", e))?;
+        records = Some(parsed);
+    }
+
+    let Some(mut records) = records else {
+        return Err(format!("会话 {} 未找到", session_id));
+    };
+
+    let upgraded = upgrade_change_records(&session_id, &mut records);
+    if upgraded {
+        let content = serde_json::to_string_pretty(&records).map_err(|e| format!("序列化失败: {}", e))?;
+        fs::write(&path, content).map_err(|e| format!("写入文件失败: {}", e))?;
+
+        // Update in-memory cache so list/detail reflect the repaired content immediately.
+        let mut trackers = CHANGE_TRACKERS.lock().unwrap();
+        trackers.insert(session_id.clone(), records);
+
+        log::info!("[ChangeTracker] Repaired change records for session {}", session_id);
+    }
+
+    Ok(upgraded)
 }

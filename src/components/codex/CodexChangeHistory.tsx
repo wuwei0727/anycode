@@ -15,6 +15,7 @@ import {
   ChevronRight,
   Loader2,
   RefreshCw,
+  Wrench,
   AlertCircle,
   FileText,
 } from 'lucide-react';
@@ -79,6 +80,7 @@ export const CodexChangeHistory: React.FC<CodexChangeHistoryProps> = ({
   const [expandedPrompts, setExpandedPrompts] = useState<Set<number>>(new Set());
   const [filter, setFilter] = useState<FilterState>({ changeType: 'all' });
   const [exporting, setExporting] = useState(false);
+  const [repairing, setRepairing] = useState(false);
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
 
   const didSetInitialExpandedRef = useRef(false);
@@ -249,6 +251,21 @@ export const CodexChangeHistory: React.FC<CodexChangeHistoryProps> = ({
     }
   };
 
+  const handleRepair = async () => {
+    if (!sessionId) return;
+    try {
+      setRepairing(true);
+      setError(null);
+      await api.codexRepairChangeRecords(sessionId);
+      await loadChanges({ silent: true });
+    } catch (err) {
+      console.error('Failed to repair change records:', err);
+      setError(err instanceof Error ? err.message : '修复变更记录失败');
+    } finally {
+      setRepairing(false);
+    }
+  };
+
   // 渲染筛选菜单
   const renderFilterMenu = () => (
     <DropdownMenu>
@@ -315,9 +332,21 @@ export const CodexChangeHistory: React.FC<CodexChangeHistoryProps> = ({
               size="sm"
               className="h-7 w-7 p-0"
               onClick={() => loadChanges()}
-              disabled={loading}
+              disabled={loading || repairing}
             >
               <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+            </Button>
+
+            {/* 修复按钮：升级/补齐历史 diff（必要时） */}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0"
+              onClick={handleRepair}
+              disabled={loading || repairing}
+              title="修复变更记录（重新计算 diff / 补齐内容）"
+            >
+              <Wrench className={cn('h-3.5 w-3.5', repairing && 'animate-spin')} />
             </Button>
 
             {/* 导出按钮 */}
@@ -326,7 +355,7 @@ export const CodexChangeHistory: React.FC<CodexChangeHistoryProps> = ({
               size="sm"
               className="h-7 w-7 p-0"
               onClick={handleExportAll}
-              disabled={changes.length === 0 || exporting}
+              disabled={changes.length === 0 || exporting || loading || repairing}
               title="导出所有变更"
             >
               <FileDown className="h-3.5 w-3.5" />

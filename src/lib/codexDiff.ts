@@ -207,3 +207,205 @@ export const extractOldNewFromPatchText = (patchText: string): PatchDiff | null 
     newText: newLines.join('\n'),
   };
 };
+
+type PatchLine =
+  | { kind: 'context'; text: string }
+  | { kind: 'add'; text: string }
+  | { kind: 'del'; text: string };
+
+type PatchHunk = {
+  oldStart?: number;
+  newStart?: number;
+  lines: PatchLine[];
+};
+
+type PatchApplyDirection = 'forward' | 'reverse';
+
+const parseUnifiedHunkHeader = (line: string): { oldStart?: number; newStart?: number } => {
+  // Standard unified diff format: @@ -a,b +c,d @@
+  const m = line.match(/^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/);
+  if (!m) return {};
+  const oldStart = Number(m[1]);
+  const newStart = Number(m[2]);
+  return {
+    oldStart: Number.isFinite(oldStart) ? oldStart : undefined,
+    newStart: Number.isFinite(newStart) ? newStart : undefined,
+  };
+};
+
+const splitTextToLines = (text: string): { lines: string[]; hasTrailingNewline: boolean } => {
+  const normalized = (text || '').replace(/\r\n/g, '\n');
+  const hasTrailingNewline = normalized.endsWith('\n');
+  const parts = normalized.split('\n');
+  if (parts.length > 0 && parts[parts.length - 1] === '') parts.pop();
+  return { lines: parts, hasTrailingNewline };
+};
+
+const parsePatchHunks = (patchText: string): PatchHunk[] => {
+  if (!patchText) return [];
+  const lines = patchText.split(/\r?\n/);
+
+  const hunks: PatchHunk[] = [];
+  let current: PatchHunk | null = null;
+  let inHunk = false;
+
+  const pushCurrent = () => {
+    if (current && current.lines.length > 0) hunks.push(current);
+    current = null;
+    inHunk = false;
+  };
+
+  const ensureHunk = () => {
+    if (!current) current = { lines: [] };
+  };
+
+  for (const raw of lines) {
+    const line = raw ?? '';
+
+    if (line.startsWith('@@')) {
+      pushCurrent();
+      current = { ...parseUnifiedHunkHeader(line), lines: [] };
+      inHunk = true;
+      continue;
+    }
+
+    if (isApplyPatchHeaderLine(line) || isDiffHeaderLine(line)) {
+      continue;
+    }
+
+    if (line.startsWith('\\ No newline')) continue;
+
+    if (line.startsWith('+') && !line.startsWith('+++')) {
+      ensureHunk();
+      current!.lines.push({ kind: 'add', text: line.slice(1) });
+      inHunk = true;
+      continue;
+    }
+
+    if (line.startsWith('-') && !line.startsWith('---')) {
+      ensureHunk();
+      current!.lines.push({ kind: 'del', text: line.slice(1) });
+      inHunk = true;
+      continue;
+    }
+
+    if (line.startsWith(' ')) {
+      ensureHunk();
+      current!.lines.push({ kind: 'context', text: line.slice(1) });
+      inHunk = true;
+      continue;
+    }
+
+    // Some patch formats omit the leading space for context lines inside a hunk.
+    if (inHunk) {
+      ensureHunk();
+      current!.lines.push({ kind: 'context', text: line });
+    }
+  }
+
+  pushCurrent();
+  return hunks;
+};
+
+const matchesSeqAt = (lines: string[], seq: string[], at: number): boolean => {
+  if (seq.length === 0) return true;
+  if (at < 0) return false;
+  if (at + seq.length > lines.length) return false;
+  for (let j = 0; j < seq.length; j++) {
+    if (lines[at + j] !== seq[j]) return false;
+  }
+  return true;
+};
+
+const findSeqWithGuess = (lines: string[], seq: string[], cursor: number, guess: number | null): number => {
+  if (seq.length === 0) return Math.max(0, Math.min(cursor, lines.length));
+
+  const maxStart = lines.length - seq.length;
+  if (maxStart < 0) return -1;
+
+  const clampedCursor = Math.max(0, Math.min(cursor, maxStart));
+
+  if (guess !== null && Number.isFinite(guess)) {
+    const g = Math.max(0, Math.min(guess, maxStart));
+    const start = Math.max(0, g - 50);
+    const end = Math.min(maxStart, g + 50);
+    for (let i = start; i <= end; i++) {
+      if (matchesSeqAt(lines, seq, i)) return i;
+    }
+  }
+
+  for (let i = clampedCursor; i <= maxStart; i++) {
+    if (matchesSeqAt(lines, seq, i)) return i;
+  }
+
+  for (let i = 0; i < clampedCursor; i++) {
+    if (matchesSeqAt(lines, seq, i)) return i;
+  }
+
+  return -1;
+};
+
+const buildHunkSequences = (
+  hunk: PatchHunk,
+  direction: PatchApplyDirection
+): { expected: string[]; replacement: string[] } => {
+  const expected: string[] = [];
+  const replacement: string[] = [];
+
+  for (const line of hunk.lines) {
+    if (line.kind === 'context') {
+      expected.push(line.text);
+      replacement.push(line.text);
+      continue;
+    }
+
+    if (direction === 'forward') {
+      if (line.kind === 'del') expected.push(line.text);
+      if (line.kind === 'add') replacement.push(line.text);
+    } else {
+      if (line.kind === 'add') expected.push(line.text);
+      if (line.kind === 'del') replacement.push(line.text);
+    }
+  }
+
+  return { expected, replacement };
+};
+
+/**
+ * Best-effort apply unified/apply_patch-like diffs onto a text blob.
+ *
+ * - `forward`: old -> new
+ * - `reverse`: new -> old
+ *
+ * Returns `null` when the patch can't be applied cleanly.
+ */
+export const tryApplyPatchToText = (
+  baseText: string,
+  patchText: string,
+  direction: PatchApplyDirection = 'forward'
+): string | null => {
+  if (!patchText || typeof patchText !== 'string') return null;
+  if (!patchText.trim()) return null;
+
+  const hunks = parsePatchHunks(patchText);
+  if (hunks.length === 0) return null;
+
+  const { lines: baseLines, hasTrailingNewline } = splitTextToLines(baseText || '');
+  const out = baseLines.slice();
+
+  let cursor = 0;
+  for (const hunk of hunks) {
+    const { expected, replacement } = buildHunkSequences(hunk, direction);
+
+    const guessLine = direction === 'forward' ? hunk.oldStart : hunk.newStart;
+    const guess = typeof guessLine === 'number' ? Math.max(0, guessLine - 1) : null;
+
+    const start = findSeqWithGuess(out, expected, cursor, guess);
+    if (start < 0) return null;
+
+    out.splice(start, expected.length, ...replacement);
+    cursor = start + replacement.length;
+  }
+
+  return out.join('\n') + (hasTrailingNewline ? '\n' : '');
+};

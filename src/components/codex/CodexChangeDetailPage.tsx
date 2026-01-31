@@ -308,8 +308,25 @@ export const CodexChangeDetailPage: React.FC<CodexChangeDetailPageProps> = ({
   const fileName = pathParts[pathParts.length - 1] || change?.file_path || '';
   const dirPath = pathParts.slice(0, -1).join('/');
 
-  const oldText = change?.old_content ?? '';
-  const newText = change?.new_content ?? '';
+  // Normalize trailing newline for diff rendering:
+  // If only one side has a trailing newline, diff engines may show a bogus "-1/+1" replacement
+  // (e.g. "No newline at end of file"). The official plugin typically reports pure insertions,
+  // so we align the view by ensuring both sides either have a trailing newline or not.
+  const { oldText, newText } = useMemo(() => {
+    const oldRaw = change?.old_content ?? '';
+    const newRaw = change?.new_content ?? '';
+    if (!oldRaw && !newRaw) return { oldText: '', newText: '' };
+    if (!oldRaw || !newRaw) return { oldText: oldRaw, newText: newRaw };
+
+    const oldHas = oldRaw.endsWith('\n');
+    const newHas = newRaw.endsWith('\n');
+    if (oldHas === newHas) return { oldText: oldRaw, newText: newRaw };
+
+    return {
+      oldText: oldHas ? oldRaw : `${oldRaw}\n`,
+      newText: newHas ? newRaw : `${newRaw}\n`,
+    };
+  }, [change?.old_content, change?.new_content]);
 
   const rawRows = useMemo(() => buildRawRows(oldText, newText), [oldText, newText]);
   const hasAnyContent = Boolean(oldText || newText || change?.unified_diff);

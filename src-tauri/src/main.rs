@@ -118,7 +118,7 @@ use commands::codex::{
     force_refresh_codex_capabilities,
     // Codex change tracker
     codex_record_file_change, codex_list_file_changes, codex_get_change_detail,
-    codex_export_patch, codex_export_single_change, codex_clear_change_records,
+    codex_export_patch, codex_export_single_change, codex_clear_change_records, codex_repair_change_records,
     CodexProcessState,
 };
 use commands::engine_status::{
@@ -529,6 +529,7 @@ fn main() {
             codex_export_patch,
             codex_export_single_change,
             codex_clear_change_records,
+            codex_repair_change_records,
             // Window Management (Multi-window support)
             create_session_window,
             close_session_window,

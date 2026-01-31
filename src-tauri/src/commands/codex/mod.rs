@@ -195,6 +195,7 @@ pub use change_tracker::{
     codex_export_patch,
     codex_export_single_change,
     codex_clear_change_records,
+    codex_repair_change_records,
     // Types
     CodexFileChange,
     ChangeType,

@@ -10,7 +10,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { api, type Session } from '@/lib/api';
 import type { ClaudeStreamMessage } from '@/types/claude';
 import { CodexEventConverter } from '@/lib/codexConverter';
-import { extractFilePathFromPatchText, extractOldNewFromPatchText, splitPatchIntoFileChunks } from '@/lib/codexDiff';
+import { extractFilePathFromPatchText, extractOldNewFromPatchText, splitPatchIntoFileChunks, tryApplyPatchToText } from '@/lib/codexDiff';
 import type { CodexFileChange } from '@/types/codex-changes';
 
 interface SessionFileChangedEvent {
@@ -288,7 +288,28 @@ export function useSessionFileWatcher(config: UseSessionFileWatcherConfig): UseS
             const diskNewContent =
               resolvedChangeType === 'delete' ? null : await safeReadFile(entry.filePath);
             const newContent = (diskNewContent ?? entry.toolNewContent ?? entry.fallbackNewContent ?? '') || '';
-            const oldContentToSend = resolvedChangeType === 'create' ? null : (oldContent ?? '');
+            let oldContentToSend = resolvedChangeType === 'create' ? null : (oldContent ?? '');
+
+            // If old snapshot was captured too late (common for fast apply_patch), old may equal new.
+            // In that case, try to reconstruct the real "before" by reverse-applying the patch onto new.
+            if (
+              resolvedChangeType === 'update' &&
+              typeof oldContentToSend === 'string' &&
+              typeof entry.diffHint === 'string' &&
+              entry.diffHint.trim().length > 0 &&
+              typeof newContent === 'string' &&
+              newContent.length > 0 &&
+              (oldContentToSend.trim().length === 0 || oldContentToSend === newContent)
+            ) {
+              const reconstructedOld = tryApplyPatchToText(newContent, entry.diffHint, 'reverse');
+              if (reconstructedOld !== null && reconstructedOld !== newContent) {
+                oldContentToSend = reconstructedOld;
+              } else if (oldContentToSend === newContent) {
+                // If we can't reconstruct, prefer letting the backend fall back to patch-based stats
+                // instead of recording a misleading "0 lines changed".
+                oldContentToSend = '';
+              }
+            }
 
             await api.codexRecordFileChange(
               sessionId,

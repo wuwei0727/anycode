@@ -184,6 +184,31 @@ function countLines(text: string): number {
   return trimmed.split("\n").length;
 }
 
+function countUnifiedDiffLines(diffText: string): { added: number; removed: number } {
+  let added = 0;
+  let removed = 0;
+  for (const line of String(diffText || '').split(/\r?\n/)) {
+    if (line.startsWith('+') && !line.startsWith('+++ ')) {
+      added += 1;
+    } else if (line.startsWith('-') && !line.startsWith('--- ')) {
+      removed += 1;
+    }
+  }
+  return { added, removed };
+}
+
+function getChangeLineStats(change: CodexFileChange): { added: number; removed: number } {
+  const addedRaw = typeof change.lines_added === 'number' ? change.lines_added : null;
+  const removedRaw = typeof change.lines_removed === 'number' ? change.lines_removed : null;
+  if (addedRaw !== null || removedRaw !== null) {
+    return { added: addedRaw ?? 0, removed: removedRaw ?? 0 };
+  }
+  if (typeof change.unified_diff === 'string' && change.unified_diff.trim()) {
+    return countUnifiedDiffLines(change.unified_diff);
+  }
+  return { added: 0, removed: 0 };
+}
+
 export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
   group,
   className,
@@ -230,6 +255,21 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
     });
     return blocks;
   }, [group.messages]);
+
+  const hasAnyFileToolUse = useMemo(() => {
+    const fileToolNames = new Set([
+      'edit',
+      'multiedit',
+      'write',
+      'write_file',
+      'create_file',
+      'delete_file',
+      'remove_file',
+      'apply_patch',
+      'file_change',
+    ]);
+    return toolUseBlocks.some((tool) => fileToolNames.has((tool.name || '').toLowerCase()));
+  }, [toolUseBlocks]);
 
   const { getStatusById, getResultById } = useToolResults();
 
@@ -491,6 +531,7 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
             (key && touchedFilePaths.has(key)) ||
             (baseNameKey && touchedFileNames.has(baseNameKey));
           const matchByPrompt =
+            hasAnyFileToolUse &&
             resolvedPromptIndex !== undefined &&
             resolvedPromptIndex !== null &&
             resolvedPromptIndex >= 0 &&
@@ -514,7 +555,7 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
       if (refreshTimer) clearTimeout(refreshTimer);
       if (unlisten) unlisten();
     };
-  }, [normalizeChangeKeyForCompare, resolvedPromptIndex, sessionId, touchedFileNames, touchedFilePaths]);
+  }, [hasAnyFileToolUse, normalizeChangeKeyForCompare, resolvedPromptIndex, sessionId, touchedFileNames, touchedFilePaths]);
 
   // Prefer change-records (prompt-scoped) for the bottom "files changed" summary.
   // Some sessions have prompt-index drift between UI and recorded change indices; we pick the
@@ -555,6 +596,7 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
         const all = await api.codexListFileChanges(sid);
         if (cancelled) return;
         const toolTouchedFiles = new Set<string>();
+        let sawAnyFileTool = false;
         const toolUseIds = new Set<string>();
         const fileToolNames = new Set([
           'edit',
@@ -572,9 +614,16 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
           if (tool.id) toolUseIds.add(tool.id);
           const name = (tool.name || '').toLowerCase();
           if (!fileToolNames.has(name)) return;
+          sawAnyFileTool = true;
           const fp = extractFilePathFromTool(tool) || tool.input?.file_path || tool.input?.path || tool.input?.file || '';
           const key = normalizeChangeKeyForCompare(String(fp)).trim();
           if (key) toolTouchedFiles.add(key);
+        });
+        const toolTouchedFileNames = new Set<string>();
+        toolTouchedFiles.forEach((p) => {
+          const base = getFileName(p).trim();
+          if (!base) return;
+          toolTouchedFileNames.add(normalizeChangeKeyForCompare(base));
         });
 
         const groupEndTimestampMs = groupEndMs;
@@ -619,54 +668,94 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
             .slice()
             .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 
-          const latestByFile = new Map<string, { filePath: string; change: CodexFileChange }>();
+          const latestByFile = new Map<string, { filePath: string; change: CodexFileChange; stats: { added: number; removed: number } }>();
           for (const change of promptChanges) {
             const key = normalizeChangeKeyForCompare(change.file_path).trim();
             if (!key) continue;
+            const stats = getChangeLineStats(change);
+            // Skip records that have no net diff (common when running read-only commands in a dirty repo).
+            if (stats.added === 0 && stats.removed === 0) continue;
             const displayPath = normalizeChangePathForCompare(change.file_path).trim() || change.file_path;
-            latestByFile.set(key, { filePath: displayPath, change });
+            latestByFile.set(key, { filePath: displayPath, change, stats });
           }
 
-          const entries = Array.from(latestByFile.values()).map(({ filePath, change }) => ({
+          const entries = Array.from(latestByFile.values()).map(({ filePath, stats }) => ({
             filePath,
-            added: change.lines_added || 0,
-            removed: change.lines_removed || 0,
+            added: stats.added,
+            removed: stats.removed,
           }));
+          const idByFile: Record<string, string> = {};
+          latestByFile.forEach((v, key) => {
+            if (!key) return;
+            if (v.change?.id) idByFile[key] = v.change.id;
+          });
 
           const endTs = promptChanges.length > 0 ? promptChanges[promptChanges.length - 1]!.timestamp : '';
           const endMs = endTs ? parseTimestampMs(endTs) : null;
 
-          return { entries, endMs, toolCallIds: bucket?.toolCallIds || new Set<string>() };
+          return { entries, idByFile, endMs, toolCallIds: bucket?.toolCallIds || new Set<string>() };
+        };
+
+        const filterEntriesToToolTouchedFiles = (entries: ChangedFileEntry[]): ChangedFileEntry[] => {
+          if (toolTouchedFiles.size === 0) return entries;
+          const filtered = entries.filter((e) => {
+            const raw = String(e.filePath || '').trim();
+            if (!raw) return false;
+            const key = normalizeChangeKeyForCompare(raw).trim();
+            if (key && toolTouchedFiles.has(key)) return true;
+            const base = normalizeChangeKeyForCompare(getFileName(raw)).trim();
+            return base ? toolTouchedFileNames.has(base) : false;
+          });
+          return filtered.length > 0 ? filtered : entries;
+        };
+
+        const filterResultToToolTouchedFiles = (result: {
+          entries: ChangedFileEntry[];
+          idByFile: Record<string, string>;
+          endMs: number | null;
+          toolCallIds: Set<string>;
+        }) => {
+          if (toolTouchedFiles.size === 0) return result;
+          const entries = filterEntriesToToolTouchedFiles(result.entries);
+          const idByFile: Record<string, string> = {};
+          entries.forEach((e) => {
+            const key = normalizeChangeKeyForCompare(e.filePath).trim();
+            const id = key ? result.idByFile[key] : undefined;
+            if (id) idByFile[key] = id;
+          });
+          return { ...result, entries, idByFile };
         };
 
         // If we can match by tool_call_id, that's the most accurate set for this Finished working block.
         if (toolMatchedChanges.length > 0) {
-          const latestByFile = new Map<string, { filePath: string; change: CodexFileChange }>();
+          const latestByFile = new Map<string, { filePath: string; change: CodexFileChange; stats: { added: number; removed: number } }>();
           toolMatchedChanges
             .slice()
             .sort((a, b) => a.timestamp.localeCompare(b.timestamp))
             .forEach((change) => {
               const key = normalizeChangeKeyForCompare(change.file_path).trim();
               if (!key) return;
+              const stats = getChangeLineStats(change);
+              if (stats.added === 0 && stats.removed === 0) return;
               const displayPath = normalizeChangePathForCompare(change.file_path).trim() || change.file_path;
-              latestByFile.set(key, { filePath: displayPath, change });
+              latestByFile.set(key, { filePath: displayPath, change, stats });
             });
 
           const idByFile: Record<string, string> = {};
-          const entries = Array.from(latestByFile.values()).map(({ filePath, change }) => {
+          const entries = Array.from(latestByFile.values()).map(({ filePath, change, stats }) => {
             idByFile[normalizeChangeKeyForCompare(change.file_path)] = change.id;
             return {
               filePath,
-              added: change.lines_added || 0,
-              removed: change.lines_removed || 0,
+              added: stats.added,
+              removed: stats.removed,
             };
           });
 
-          if (!cancelled) {
+          if (!cancelled && entries.length > 0) {
             setPromptChangeIdByFile(idByFile);
             setPromptChangedFiles(entries);
+            return;
           }
-          return;
         }
 
         const candidates = Array.from(changesByPrompt.keys());
@@ -684,6 +773,47 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
                 setPromptChangeIdByFile(null);
               }, 250 * retry.attempts);
             }
+          }
+          return;
+        }
+
+        const hasFileToolsInGroup = sawAnyFileTool || toolTouchedFiles.size > 0;
+
+        // If we know the promptIndex, only show exact-match records unless we have evidence
+        // that file tools ran (then we may need to search due to prompt-index drift).
+        if (pi !== null) {
+          // Multiple "Finished working" blocks can exist within one prompt (e.g. tool-only vs text responses).
+          // Do not show the whole prompt's changed-files list on a read-only block; only blocks that actually
+          // ran file-changing tools (edit/write/apply_patch/...) should display prompt-scoped changes.
+          if (!hasFileToolsInGroup) {
+            if (!cancelled) {
+              setPromptChangeIdByFile(null);
+              setPromptChangedFiles([]);
+            }
+            return;
+          }
+
+          const exact = filterResultToToolTouchedFiles(buildEntriesForPrompt(pi));
+          if (exact.entries.length > 0) {
+            if (!cancelled) {
+              setPromptChangeIdByFile(Object.keys(exact.idByFile).length > 0 ? exact.idByFile : null);
+              setPromptChangedFiles(filterEntriesToToolTouchedFiles(exact.entries));
+            }
+            return;
+          }
+
+          if (!hasFileToolsInGroup) {
+            if (!cancelled) {
+              setPromptChangeIdByFile(null);
+              setPromptChangedFiles([]);
+            }
+            return;
+          }
+        } else if (!hasFileToolsInGroup) {
+          // No prompt index and no file tools => don't guess by time (prevents false positives).
+          if (!cancelled) {
+            setPromptChangeIdByFile(null);
+            setPromptChangedFiles([]);
           }
           return;
         }
@@ -717,7 +847,7 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
 
         // If we have a prompt index from the UI, start from it; otherwise start from the first candidate.
         const initialIdx = pi !== null ? pi : candidates[0]!;
-        const baseline = buildEntriesForPrompt(initialIdx);
+        const baseline = filterResultToToolTouchedFiles(buildEntriesForPrompt(initialIdx));
         const baselineToolMatch = computeToolCallMatch(baseline.toolCallIds);
         let best = {
           idx: initialIdx,
@@ -726,11 +856,13 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
           dist: computeDist(baseline.endMs),
           toolMatch: baselineToolMatch,
           entries: baseline.entries,
+          idByFile: baseline.idByFile,
         };
 
         candidates.forEach((idx) => {
           if (idx === initialIdx) return;
-          const { entries, endMs, toolCallIds } = buildEntriesForPrompt(idx);
+          const candidate = filterResultToToolTouchedFiles(buildEntriesForPrompt(idx));
+          const { entries, endMs, toolCallIds } = candidate;
           const score = computeScore(entries);
           const dist = computeDist(endMs);
           const toolMatch = computeToolCallMatch(toolCallIds);
@@ -751,13 +883,13 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
                   (dist < best.dist || (dist === best.dist && Math.abs(idx - initialIdx) < Math.abs(best.idx - initialIdx))));
 
           if (isBetter) {
-            best = { idx, score, endMs, dist, toolMatch, entries };
+            best = { idx, score, endMs, dist, toolMatch, entries, idByFile: candidate.idByFile };
           }
         });
 
         if (!cancelled) {
-          setPromptChangeIdByFile(null);
-          setPromptChangedFiles(best.entries);
+          setPromptChangeIdByFile(Object.keys(best.idByFile).length > 0 ? best.idByFile : null);
+          setPromptChangedFiles(filterEntriesToToolTouchedFiles(best.entries));
 
           // If we still didn't get any matched entries but file tools touched files,
           // it's likely the recorder hasn't flushed yet. Retry briefly.
@@ -1006,8 +1138,8 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
 
       // 1) If we matched change-records by tool_call_id for this activity group,
       // use that id directly (avoids prompt-index drift).
-      const wantedNorm = normalizeForCompare(filePath);
-      const directId = wantedNorm ? promptChangeIdByFile?.[wantedNorm] : undefined;
+      const wantedKey = normalizeChangeKeyForCompare(filePath).trim();
+      const directId = wantedKey ? promptChangeIdByFile?.[wantedKey] : undefined;
       if (directId) {
         setSelectedChangeId(directId);
         setInitialChange(null);
@@ -1098,7 +1230,16 @@ export const ActivityMessageGroup: React.FC<ActivityMessageGroupProps> = ({
         setDiffLoading(false);
       }
     },
-    [findLocalToolDiff, group.id, matchesFile, normalizeForCompare, promptChangeIdByFile, resolvedPromptIndex, sessionId]
+    [
+      findLocalToolDiff,
+      group.id,
+      matchesFile,
+      normalizeChangeKeyForCompare,
+      normalizeForCompare,
+      promptChangeIdByFile,
+      resolvedPromptIndex,
+      sessionId,
+    ]
   );
 
   const summaryTitle = useMemo(() => {
